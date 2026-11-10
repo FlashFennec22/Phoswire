@@ -3,6 +3,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::mem::zeroed;
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::ptr::null_mut;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,7 @@ use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDL
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX,
+    SECURITY_IDENTIFICATION,
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
@@ -17,7 +20,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 use crate::config::{Mode, Rule};
-use crate::win::{last_error, sddl_to_sd, wide};
+use crate::win::{handle_owner_trusted, last_error, sddl_to_sd, wide};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\phoswire";
 const MAX_REQUEST: usize = 64 * 1024;
@@ -26,8 +29,20 @@ const MAX_REQUEST: usize = 64 * 1024;
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     Status,
-    SetMode { mode: Mode },
-    Allow { path: String, service: Option<String>, inbound: bool },
+    SetMode {
+        mode: Mode,
+        /// Learning only: revert to normal after this many hours.
+        #[serde(default)]
+        hours: Option<u32>,
+    },
+    Allow {
+        path: String,
+        service: Option<String>,
+        inbound: bool,
+        /// Withdraw inbound access from an existing rule.
+        #[serde(default)]
+        outbound_only: bool,
+    },
     Remove { path: String, service: Option<String> },
     RemoveIndex { index: usize },
     List,
@@ -39,6 +54,11 @@ pub enum Request {
 pub struct Status {
     pub version: String,
     pub mode: Mode,
+    /// Unix seconds; set while learning.
+    #[serde(default)]
+    pub learning_since: Option<u64>,
+    #[serde(default)]
+    pub learning_until: Option<u64>,
     pub rules: usize,
     pub filters: usize,
     pub warnings: Vec<String>,
@@ -88,8 +108,27 @@ pub fn request(req: &Request) -> Result<Reply, String> {
     let mut last = None;
     // The server handles one client at a time; retry briefly if it is busy.
     for _ in 0..20 {
-        match std::fs::OpenOptions::new().read(true).write(true).open(PIPE_NAME) {
+        // Identification level: whoever serves the pipe may see who we are but
+        // can never act with our (elevated) token.
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(PIPE_NAME);
+        match opened {
             Ok(mut pipe) => {
+                // An unprivileged program can create a pipe with this name
+                // while the service is down; never talk to one.
+                match handle_owner_trusted(pipe.as_raw_handle() as HANDLE) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(format!(
+                            "{PIPE_NAME} is not served by the Phoswire service (it is owned by an unprivileged \
+                             account); another program has taken the name. Refusing to use it."
+                        ))
+                    }
+                    Err(code) => return Err(format!("cannot verify who serves {PIPE_NAME} (error {code})")),
+                }
                 let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
                 line.push('\n');
                 pipe.write_all(line.as_bytes()).map_err(|e| format!("sending request: {e}"))?;
@@ -123,8 +162,9 @@ pub fn request(req: &Request) -> Result<Reply, String> {
 
 /// Serves requests forever on the calling thread.
 pub fn serve(mut handler: impl FnMut(Request) -> Reply) -> Result<(), String> {
-    // SYSTEM and Administrators only; no access for anyone else.
-    let mut sd = sddl_to_sd("D:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
+    // SYSTEM and Administrators only; no access for anyone else. The owner is
+    // set explicitly because clients check it to tell us from an impostor.
+    let mut sd = sddl_to_sd("O:BAG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)")?;
     let mut sa: SECURITY_ATTRIBUTES = unsafe { zeroed() };
     sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
     sa.lpSecurityDescriptor = sd.as_mut_ptr().cast();
@@ -187,5 +227,40 @@ fn read_line(pipe: HANDLE) -> Option<Vec<u8>> {
         if line.len() > MAX_REQUEST {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The client-side impostor check must be able to read the owner of a
+    /// pipe it opened at identification level. A pipe made by an ordinary
+    /// (non-elevated) process is exactly what an impostor's looks like.
+    #[test]
+    fn pipe_owner_can_be_read_by_the_client() {
+        let name = format!("{PIPE_NAME}-test-{}", std::process::id());
+        let server = unsafe {
+            CreateNamedPipeW(
+                wide(&name).as_ptr(),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(server, INVALID_HANDLE_VALUE, "error {}", last_error());
+        let client = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&name)
+            .unwrap();
+        let verdict = handle_owner_trusted(client.as_raw_handle() as HANDLE);
+        println!("owner trusted: {verdict:?}");
+        assert!(verdict.is_ok(), "{verdict:?}");
     }
 }

@@ -23,7 +23,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Install and start the Phoswire service (elevated)
-    Install,
+    Install {
+        /// On a machine with no configuration yet, start in learning mode
+        #[arg(long)]
+        learning: bool,
+    },
     /// Stop and remove the service (elevated)
     Uninstall,
     /// Start the installed service
@@ -33,7 +37,12 @@ enum Command {
     /// Show mode, rule count and any problems
     Status,
     /// Switch mode: normal (block unless whitelisted), learning, or disabled
-    Mode { mode: Mode },
+    Mode {
+        mode: Mode,
+        /// Learning only: switch back to normal by itself after this many hours
+        #[arg(long)]
+        hours: Option<u32>,
+    },
     /// Whitelist an executable (or `System` for the kernel)
     Allow {
         path: String,
@@ -43,8 +52,12 @@ enum Command {
         /// Also accept unsolicited inbound connections
         #[arg(long)]
         inbound: bool,
+        /// Withdraw inbound access from a rule that has it
+        #[arg(long, conflicts_with = "inbound")]
+        outbound_only: bool,
     },
-    /// Remove a rule by path or by its number from `list`
+    /// Remove a rule by path or by its number from `list` (for a file whose
+    /// name is a number, write it as a path: `.\3`)
     Remove {
         target: String,
         #[arg(long)]
@@ -77,7 +90,7 @@ fn main() -> ExitCode {
 
 fn run(command: Command) -> Result<(), String> {
     let request = match command {
-        Command::Install => return service::install().map(|m| println!("{m}")),
+        Command::Install { learning } => return service::install(learning).map(|m| println!("{m}")),
         Command::Uninstall => return service::uninstall().map(|m| println!("{m}")),
         Command::Start => return service::start().map(|m| println!("{m}")),
         Command::Stop => return service::stop().map(|m| println!("{m}")),
@@ -89,9 +102,9 @@ fn run(command: Command) -> Result<(), String> {
             return service::run(stop);
         }
         Command::Status => Request::Status,
-        Command::Mode { mode } => Request::SetMode { mode },
-        Command::Allow { path, service, inbound } => {
-            Request::Allow { path: resolve_path(&path)?, service, inbound }
+        Command::Mode { mode, hours } => Request::SetMode { mode, hours },
+        Command::Allow { path, service, inbound, outbound_only } => {
+            Request::Allow { path: resolve_path(&path)?, service, inbound, outbound_only }
         }
         Command::Remove { target, service } => match target.parse::<usize>() {
             Ok(index) if service.is_none() => Request::RemoveIndex { index },
@@ -148,7 +161,19 @@ fn print_reply(reply: Reply) -> Result<(), String> {
             println!("  rules:   {}", s.rules);
             println!("  filters: {}", s.filters);
             match s.mode {
-                Mode::Learning => println!("  Outbound traffic is open and being learned; switch back with `phoswire mode normal`."),
+                Mode::Learning => {
+                    println!("  Outbound traffic is open and being learned; switch back with `phoswire mode normal`.");
+                    if let Some(since) = s.learning_since {
+                        println!("  Learning since {}.", age(since));
+                    }
+                    match s.learning_until {
+                        Some(until) => {
+                            let mins = until.saturating_sub(config::now()) / 60;
+                            println!("  Reverts to normal in {}h {}m.", mins / 60, mins % 60);
+                        }
+                        None => println!("  No end time set; `phoswire mode learning --hours N` sets one."),
+                    }
+                }
                 Mode::Disabled => println!("  Phoswire is not filtering; only Windows Firewall applies."),
                 Mode::Normal => {}
             }
@@ -165,7 +190,7 @@ fn print_reply(reply: Reply) -> Result<(), String> {
                 println!("  warning: {w}");
             }
             if !s.unresolved.is_empty() {
-                println!("  seen while learning but not whitelisted (service could not be identified):");
+                println!("  seen while learning but not whitelisted (could not be identified):");
                 for u in &s.unresolved {
                     println!("    {u}");
                 }
@@ -175,6 +200,7 @@ fn print_reply(reply: Reply) -> Result<(), String> {
             if rules.is_empty() {
                 println!("The whitelist is empty.");
             }
+            let mut unprotected = false;
             for (i, r) in rules.iter().enumerate() {
                 let mut tags = vec![match r.source {
                     Source::Manual => "manual".to_string(),
@@ -183,7 +209,16 @@ fn print_reply(reply: Reply) -> Result<(), String> {
                 if r.inbound {
                     tags.push("inbound".into());
                 }
+                if !win::in_protected_dir(&r.path) {
+                    tags.push("unprotected path".into());
+                    unprotected = true;
+                }
                 println!("{:>3}  {}  ({}, {})", i + 1, r.subject(), tags.join(", "), age(r.added));
+            }
+            if unprotected {
+                println!();
+                println!("Rules trust a path, not a file. \"unprotected path\" marks a rule outside Program Files and");
+                println!("Windows, where a program without administrator rights could replace the trusted file.");
             }
         }
         Reply::Blocked { entries } => {

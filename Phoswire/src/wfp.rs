@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::mem::zeroed;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -92,6 +92,11 @@ pub fn app_id(path: &str) -> Result<Vec<u8>, String> {
     if path.eq_ignore_ascii_case(SYSTEM_APP) {
         return Ok(wide(SYSTEM_APP).iter().flat_map(|c| c.to_le_bytes()).collect());
     }
+    // Network shares and raw device paths (what WFP reports for an app with
+    // no drive letter) are used as they are, without opening the file.
+    if let Some(nt) = win::device_path(path) {
+        return Ok(wide(&nt).iter().flat_map(|c| c.to_le_bytes()).collect());
+    }
     unsafe {
         let mut blob: *mut FWP_BYTE_BLOB = null_mut();
         let rc = FwpmGetAppIdFromFileName0(wide(path).as_ptr(), &mut blob);
@@ -125,22 +130,29 @@ pub fn build_policy(cfg: &Config) -> (Vec<FilterSpec>, Vec<String>) {
         specs.push(FilterSpec::permit("Phoswire: loopback", layer, W_LOOPBACK, vec![Cond::Loopback]));
     }
 
-    // DHCP, without which the machine never gets an address.
+    let svchost = app_id(&win::system_svchost());
+
+    // DHCP, without which the machine never gets an address. Limited to the
+    // DHCP Client service so the ports are not an open channel for any app;
+    // if the service cannot be resolved the rule stays, unscoped, rather than
+    // costing the machine its address.
+    let dhcp_scope = match (svchost.clone(), win::service_sd("Dhcp")) {
+        (Ok(app), Ok(sd)) => vec![Cond::App(app.clone()), Cond::UserSd(sd)],
+        (Err(e), _) | (_, Err(e)) => {
+            warnings.push(format!("DHCP rules are not limited to the DHCP Client service: {e}"));
+            Vec::new()
+        }
+    };
+    let dhcp = |local: u16, remote: u16| {
+        let mut conds = dhcp_scope.clone();
+        conds.extend([Cond::Protocol(IPPROTO_UDP), Cond::LocalPort(local), Cond::RemotePort(remote)]);
+        conds
+    };
     for layer in [Layer::ConnectV4, Layer::AcceptV4] {
-        specs.push(FilterSpec::permit(
-            "Phoswire: DHCP",
-            layer,
-            W_ESSENTIAL,
-            vec![Cond::Protocol(IPPROTO_UDP), Cond::LocalPort(68), Cond::RemotePort(67)],
-        ));
+        specs.push(FilterSpec::permit("Phoswire: DHCP", layer, W_ESSENTIAL, dhcp(68, 67)));
     }
     for layer in [Layer::ConnectV6, Layer::AcceptV6] {
-        specs.push(FilterSpec::permit(
-            "Phoswire: DHCPv6",
-            layer,
-            W_ESSENTIAL,
-            vec![Cond::Protocol(IPPROTO_UDP), Cond::LocalPort(546), Cond::RemotePort(547)],
-        ));
+        specs.push(FilterSpec::permit("Phoswire: DHCPv6", layer, W_ESSENTIAL, dhcp(546, 547)));
         // Router/neighbour solicitation and advertisement: IPv6's ARP.
         let mut conds = vec![Cond::Protocol(IPPROTO_ICMPV6)];
         conds.extend((133..=136).map(Cond::LocalPort));
@@ -148,11 +160,7 @@ pub fn build_policy(cfg: &Config) -> (Vec<FilterSpec>, Vec<String>) {
     }
 
     // Name resolution, scoped to the DNS Client service only.
-    let svchost = format!(
-        "{}\\System32\\svchost.exe",
-        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into())
-    );
-    match (app_id(&svchost), win::service_sd("Dnscache")) {
+    match (svchost, win::service_sd("Dnscache")) {
         (Ok(app), Ok(sd)) => {
             for layer in Layer::OUTBOUND {
                 specs.push(FilterSpec::permit(
@@ -277,7 +285,9 @@ unsafe extern "system" fn on_net_event(context: *mut core::ffi::c_void, event: *
         remote_port: if has(FWPM_NET_EVENT_FLAG_REMOTE_PORT_SET) { h.remotePort } else { 0 },
     };
     // Keep the WFP callback thread free: all real work happens on the receiver.
-    let _ = (*(context as *const Sender<NetEvent>)).send(out);
+    // The queue is bounded; under a flood, events are dropped rather than
+    // letting a local program grow the service's memory without limit.
+    let _ = (*(context as *const SyncSender<NetEvent>)).try_send(out);
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +301,8 @@ pub struct Engine {
     /// WFP refuses from a dynamic session (FWP_E_DYNAMIC_SESSION_IN_PROGRESS).
     control: HANDLE,
     events: HANDLE,
+    /// True while the "report allowed connections" keyword is on because we set it.
+    allow_events_ours: bool,
     filter_ids: Vec<u64>,
     block_ids: HashSet<u64>,
     /// Run-time layer ids, as reported in net events.
@@ -334,6 +346,7 @@ impl Engine {
                 handle,
                 control,
                 events: null_mut(),
+                allow_events_ours: false,
                 filter_ids: Vec::new(),
                 block_ids: HashSet::new(),
                 layer_ids: Vec::new(),
@@ -474,7 +487,7 @@ impl Engine {
 
     /// Starts delivering classify events to `tx`. Drops are always reported;
     /// allows only while `set_allow_events(true)` is in effect.
-    pub fn subscribe(&mut self, tx: Sender<NetEvent>) -> Result<(), String> {
+    pub fn subscribe(&mut self, tx: SyncSender<NetEvent>) -> Result<(), String> {
         unsafe {
             let mut on: FWP_VALUE0 = zeroed();
             on.r#type = FWP_UINT32;
@@ -501,11 +514,39 @@ impl Engine {
     }
 
     /// Asks the engine to also report permitted connections (learning mode).
-    pub fn set_allow_events(&self, enabled: bool) -> Result<(), String> {
+    ///
+    /// The keyword mask is one machine-wide setting shared with every other
+    /// WFP tool, so only our own bit is touched, and it is only cleared if
+    /// this process was the one that set it.
+    pub fn set_allow_events(&mut self, enabled: bool) -> Result<(), String> {
+        const ALLOW: u32 = FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW;
         unsafe {
+            let mut current = 0u32;
+            let mut got: *mut FWP_VALUE0 = null_mut();
+            if FwpmEngineGetOption0(self.control, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, &mut got) == 0
+                && !got.is_null()
+            {
+                if (*got).r#type == FWP_UINT32 {
+                    current = (*got).Anonymous.uint32;
+                }
+                FwpmFreeMemory0(&mut got as *mut _ as *mut *mut core::ffi::c_void);
+            }
+            let wanted = if enabled {
+                if current & ALLOW == 0 {
+                    self.allow_events_ours = true;
+                }
+                current | ALLOW
+            } else if std::mem::take(&mut self.allow_events_ours) {
+                current & !ALLOW
+            } else {
+                current
+            };
+            if wanted == current {
+                return Ok(());
+            }
             let mut v: FWP_VALUE0 = zeroed();
             v.r#type = FWP_UINT32;
-            v.Anonymous.uint32 = if enabled { FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW } else { 0 };
+            v.Anonymous.uint32 = wanted;
             check(
                 "setting net event keywords",
                 FwpmEngineSetOption0(self.control, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, &v),
@@ -543,13 +584,13 @@ mod tests {
 
     #[test]
     fn disabled_installs_nothing() {
-        let (specs, warnings) = build_policy(&Config { mode: Mode::Disabled, rules: vec![rule(&svchost(), None, true)] });
+        let (specs, warnings) = build_policy(&Config { mode: Mode::Disabled, rules: vec![rule(&svchost(), None, true)], ..Config::default() });
         assert!(specs.is_empty() && warnings.is_empty());
     }
 
     #[test]
     fn normal_blocks_every_layer_by_default() {
-        let (specs, warnings) = build_policy(&Config { mode: Mode::Normal, rules: vec![] });
+        let (specs, warnings) = build_policy(&Config { mode: Mode::Normal, ..Config::default() });
         assert!(warnings.is_empty(), "{warnings:?}");
         for layer in Layer::ALL {
             let blocks: Vec<_> = specs.iter().filter(|s| s.layer == layer && !s.permit).collect();
@@ -564,7 +605,7 @@ mod tests {
 
     #[test]
     fn learning_opens_outbound_but_not_inbound() {
-        let (specs, _) = build_policy(&Config { mode: Mode::Learning, rules: vec![] });
+        let (specs, _) = build_policy(&Config { mode: Mode::Learning, ..Config::default() });
         for layer in Layer::ALL {
             let open = specs.iter().any(|s| s.layer == layer && s.permit && s.conds.is_empty());
             let blocked = specs.iter().any(|s| s.layer == layer && !s.permit);
@@ -583,6 +624,7 @@ mod tests {
                 rule(r"C:\does\not\exist.exe", None, false),
                 rule(SYSTEM_APP, None, false),
             ],
+            ..Config::default()
         };
         let (specs, warnings) = build_policy(&cfg);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
@@ -602,6 +644,50 @@ mod tests {
         assert!(crate::win::nt_to_dos(&nt).eq_ignore_ascii_case(&svchost()), "{nt}");
         // The no-file-access fallback must produce the identical id.
         assert_eq!(win::dos_to_nt(&svchost()).unwrap(), nt);
+    }
+
+    #[test]
+    fn paths_without_a_drive_letter_need_no_file_access() {
+        let utf16 = |s: &str| -> Vec<u8> { wide(s).iter().flat_map(|c| c.to_le_bytes()).collect() };
+        assert_eq!(app_id(r"\\Server\Share\App.exe").unwrap(), utf16(r"\device\mup\server\share\app.exe"));
+        assert_eq!(app_id(r"\Device\Mup\server\share\app.exe").unwrap(), utf16(r"\device\mup\server\share\app.exe"));
+        assert_eq!(win::device_path(r"C:\Windows\notepad.exe"), None);
+        assert_eq!(win::device_path(r"\\?\C:\Windows\notepad.exe"), None);
+    }
+
+    #[test]
+    fn only_the_real_svchost_is_a_service_host() {
+        assert!(win::is_svchost(&svchost().to_uppercase()));
+        assert!(!win::is_svchost(r"C:\Users\someone\svchost.exe"));
+        assert!(win::in_protected_dir(&svchost()));
+        assert!(win::in_protected_dir(SYSTEM_APP));
+        assert!(!win::in_protected_dir(r"C:\Users\someone\AppData\Local\app\app.exe"));
+    }
+
+    #[test]
+    fn dhcp_is_limited_to_the_dhcp_service() {
+        let (specs, _) = build_policy(&Config { mode: Mode::Normal, ..Config::default() });
+        let dhcp: Vec<_> = specs.iter().filter(|s| s.name.contains("DHCP")).collect();
+        assert_eq!(dhcp.len(), 4);
+        for spec in dhcp {
+            assert!(spec.conds.iter().any(|c| matches!(c, Cond::App(_))), "{}", spec.name);
+            assert!(spec.conds.iter().any(|c| matches!(c, Cond::UserSd(_))), "{}", spec.name);
+        }
+    }
+
+    #[test]
+    fn ownership_check_tells_system_files_from_missing_ones() {
+        let program_data = std::env::var("ProgramData").unwrap();
+        assert!(win::path_owner_trusted(std::path::Path::new(&program_data)));
+        assert!(!win::path_owner_trusted(std::path::Path::new(r"C:\no\such\phoswire\file")));
+    }
+
+    #[test]
+    fn old_configs_and_requests_still_parse() {
+        let cfg: Config = serde_json::from_str(r#"{"mode":"learning","rules":[]}"#).unwrap();
+        assert!(cfg.mode == Mode::Learning && cfg.learning_until.is_none());
+        let req: crate::ipc::Request = serde_json::from_str(r#"{"cmd":"set_mode","mode":"normal"}"#).unwrap();
+        assert!(matches!(req, crate::ipc::Request::SetMode { hours: None, .. }));
     }
 
     #[test]
