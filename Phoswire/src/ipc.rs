@@ -15,12 +15,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     SECURITY_IDENTIFICATION,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 use crate::config::{Mode, Rule};
-use crate::win::{handle_owner_trusted, last_error, sddl_to_sd, wide};
+use crate::win::{handle_owner_trusted, last_error, process_path, sddl_to_sd, wide};
 
 pub const PIPE_NAME: &str = r"\\.\pipe\phoswire";
 const MAX_REQUEST: usize = 64 * 1024;
@@ -122,10 +122,20 @@ pub fn request(req: &Request) -> Result<Reply, String> {
                 match handle_owner_trusted(pipe.as_raw_handle() as HANDLE) {
                     Ok(true) => {}
                     Ok(false) => {
+                        // Name the culprit: the service cannot evict it, but
+                        // an administrator can.
+                        let mut pid = 0u32;
+                        let found = unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &mut pid) };
+                        let holder = match (found != 0 && pid != 0, process_path(pid)) {
+                            (true, Some(path)) => format!("process {pid} ({path})"),
+                            (true, None) => format!("process {pid}"),
+                            (false, _) => "another program".into(),
+                        };
                         return Err(format!(
-                            "{PIPE_NAME} is not served by the Phoswire service (it is owned by an unprivileged \
-                             account); another program has taken the name. Refusing to use it."
-                        ))
+                            "{PIPE_NAME} is not served by the Phoswire service: {holder}, running without \
+                             administrator rights, has taken the name. Refusing to use it. The firewall itself \
+                             keeps filtering; end that program and the service takes the name back within seconds."
+                        ));
                     }
                     Err(code) => return Err(format!("cannot verify who serves {PIPE_NAME} (error {code})")),
                 }
