@@ -72,13 +72,19 @@ impl Rule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mode: Mode,
+    /// Unix seconds at which learning mode was switched on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_since: Option<u64>,
+    /// Unix seconds at which learning mode reverts to normal by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learning_until: Option<u64>,
     #[serde(default)]
     pub rules: Vec<Rule>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { mode: Mode::Normal, rules: Vec::new() }
+        Config { mode: Mode::Normal, learning_since: None, learning_until: None, rules: Vec::new() }
     }
 }
 
@@ -92,6 +98,56 @@ impl Config {
         Self::dir().join("config.json")
     }
 
+    /// Makes the data directory safe to trust and returns notes worth logging.
+    ///
+    /// `%ProgramData%` lets every user create files in new subfolders, so
+    /// without this an unprivileged program could plant or take over the
+    /// whitelist. The directory is restricted to SYSTEM and Administrators,
+    /// and anything in it (or the directory itself) that an unprivileged
+    /// user created is moved out of the way instead of being read.
+    pub fn secure_dir() -> Result<Vec<String>, String> {
+        let dir = Self::dir();
+        let mut notes = Vec::new();
+        if let Ok(meta) = fs::symlink_metadata(&dir) {
+            if meta.file_type().is_symlink() || !meta.is_dir() || !crate::win::path_owner_trusted(&dir) {
+                let aside = dir.with_file_name(format!("Phoswire.untrusted-{}", now()));
+                fs::rename(&dir, &aside).map_err(|e| {
+                    format!("{} is not owned by an administrator and cannot be moved aside: {e}", dir.display())
+                })?;
+                notes.push(format!(
+                    "{} was not created by an administrator; moved it to {} and started fresh",
+                    dir.display(),
+                    aside.display()
+                ));
+            }
+        }
+        fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        // Not fatal: the ownership checks below and in `save` still hold, and
+        // refusing a good whitelist over this would block the whole machine.
+        if let Err(e) = crate::win::lock_down(&dir) {
+            notes.push(e);
+        }
+        for entry in fs::read_dir(&dir).map_err(|e| format!("reading {}: {e}", dir.display()))?.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "untrusted") {
+                continue;
+            }
+            let link = entry.file_type().map(|t| t.is_symlink()).unwrap_or(true);
+            if link || !crate::win::path_owner_trusted(&path) {
+                let mut aside = path.clone().into_os_string();
+                aside.push(".untrusted");
+                match fs::rename(&path, &aside) {
+                    Ok(()) => notes.push(format!(
+                        "{} was not created by an administrator; ignored and renamed to *.untrusted",
+                        path.display()
+                    )),
+                    Err(e) => return Err(format!("{} is untrusted and cannot be moved aside: {e}", path.display())),
+                }
+            }
+        }
+        Ok(notes)
+    }
+
     pub fn load() -> io::Result<Config> {
         match fs::read(Self::file()) {
             Ok(bytes) => serde_json::from_slice(&bytes)
@@ -103,9 +159,14 @@ impl Config {
 
     /// Write atomically so a crash never leaves a truncated whitelist behind.
     pub fn save(&self) -> io::Result<()> {
-        fs::create_dir_all(Self::dir())?;
+        use io::Write;
         let tmp = Self::dir().join("config.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(self).map_err(io::Error::other)?)?;
+        // Never write through a leftover: always a brand-new file of our own.
+        let _ = fs::remove_file(&tmp);
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(self).map_err(io::Error::other)?)?;
+        file.sync_all()?;
+        drop(file);
         fs::rename(&tmp, Self::file())
     }
 

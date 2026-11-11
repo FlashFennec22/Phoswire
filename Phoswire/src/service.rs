@@ -4,13 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceDependency, ServiceErrorControl,
-    ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+    ServiceDependency, ServiceErrorControl, ServiceExitCode, ServiceFailureActions,
+    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -26,11 +28,21 @@ const MAX_BLOCKED: usize = 500;
 const MAX_UNRESOLVED: usize = 50;
 const PORT_CACHE_TTL: Duration = Duration::from_secs(10);
 const SOCKET_POLL: Duration = Duration::from_millis(250);
+/// Net events waiting to be processed; beyond this they are dropped.
+const EVENT_QUEUE: usize = 4096;
+/// Learning left on this long without an end time earns a warning in `status`.
+const LEARNING_NAG_SECS: u64 = 24 * 3600;
+
+/// Set once the data directory has been verified; until then nothing is
+/// written there, because it may be under an unprivileged user's control.
+static LOG_TO_FILE: AtomicBool = AtomicBool::new(false);
 
 pub fn log(msg: &str) {
     eprintln!("{msg}");
+    if !LOG_TO_FILE.load(Ordering::Relaxed) {
+        return;
+    }
     let path = Config::dir().join("phoswire.log");
-    let _ = std::fs::create_dir_all(Config::dir());
     if std::fs::metadata(&path).map(|m| m.len() > 1_000_000).unwrap_or(false) {
         let _ = std::fs::rename(&path, Config::dir().join("phoswire.log.old"));
     }
@@ -59,17 +71,32 @@ pub struct Core {
 
 impl Core {
     pub fn start() -> Result<(Core, Receiver<NetEvent>), String> {
-        let cfg = match Config::load() {
-            Ok(cfg) => cfg,
+        let mut cfg = match Config::secure_dir() {
+            Ok(notes) => {
+                LOG_TO_FILE.store(true, Ordering::Relaxed);
+                notes.iter().for_each(|n| log(n));
+                match Config::load() {
+                    Ok(cfg) => cfg,
+                    Err(e) => {
+                        // Fail closed: an unreadable whitelist means nothing is trusted.
+                        log(&format!("config unreadable ({e}); starting with an empty whitelist"));
+                        let _ = std::fs::rename(Config::file(), Config::dir().join("config.json.bad"));
+                        Config::default()
+                    }
+                }
+            }
             Err(e) => {
-                // Fail closed: an unreadable whitelist means nothing is trusted.
-                log(&format!("config unreadable ({e}); starting with an empty whitelist"));
-                let _ = std::fs::rename(Config::file(), Config::dir().join("config.json.bad"));
+                // Fail closed here too: a data directory someone else controls
+                // is not read from and not written to.
+                log(&format!("{e}; starting with an empty whitelist that will not be saved"));
                 Config::default()
             }
         };
+        if cfg.mode == Mode::Learning && cfg.learning_since.is_none() {
+            cfg.learning_since = Some(config::now());
+        }
         let mut engine = Engine::open()?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(EVENT_QUEUE);
         if let Err(e) = engine.subscribe(tx) {
             log(&format!("{e}; learning mode and the blocked list will not work"));
         }
@@ -131,27 +158,54 @@ impl Core {
     fn handle_inner(&mut self, req: Request) -> Result<Reply, String> {
         let done = |message: String| Ok(Reply::Done { message });
         match req {
-            Request::Status => Ok(Reply::Status(Status {
-                version: env!("CARGO_PKG_VERSION").into(),
-                mode: self.cfg.mode,
-                rules: self.cfg.rules.len(),
-                filters: self.engine.filter_count(),
-                warnings: self.warnings.clone(),
-                unresolved: self.unresolved.clone(),
-                counters: self.counters.clone(),
-            })),
-            Request::SetMode { mode } => {
+            Request::Status => {
+                let mut warnings = self.warnings.clone();
+                let learning = self.cfg.mode == Mode::Learning;
+                if learning && self.cfg.learning_until.is_none() {
+                    let on_for = config::now().saturating_sub(self.cfg.learning_since.unwrap_or(u64::MAX));
+                    if on_for >= LEARNING_NAG_SECS {
+                        warnings.push(format!(
+                            "learning mode has been on for {} day(s); outbound traffic is unfiltered until you run `phoswire mode normal`",
+                            on_for / 86_400
+                        ));
+                    }
+                }
+                Ok(Reply::Status(Status {
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    mode: self.cfg.mode,
+                    learning_since: self.cfg.learning_since.filter(|_| learning),
+                    learning_until: self.cfg.learning_until.filter(|_| learning),
+                    rules: self.cfg.rules.len(),
+                    filters: self.engine.filter_count(),
+                    warnings,
+                    unresolved: self.unresolved.clone(),
+                    counters: self.counters.clone(),
+                }))
+            }
+            Request::SetMode { mode, hours } => {
+                if hours.is_some() && mode != Mode::Learning {
+                    return Err("--hours only applies to learning mode".into());
+                }
+                if hours == Some(0) {
+                    return Err("--hours must be at least 1".into());
+                }
                 let mut new = self.cfg.clone();
                 new.mode = mode;
+                let now = config::now();
+                new.learning_since = (mode == Mode::Learning).then_some(now);
+                new.learning_until = hours.map(|h| now + u64::from(h) * 3600);
                 self.commit(new)?;
                 if mode == Mode::Learning {
                     self.unresolved.clear();
                     self.polled.clear();
                 }
                 log(&format!("mode set to {mode}"));
-                done(format!("mode: {mode}"))
+                done(match hours {
+                    Some(h) => format!("mode: {mode} (reverts to normal in {h}h)"),
+                    None => format!("mode: {mode}"),
+                })
             }
-            Request::Allow { path, service, inbound } => {
+            Request::Allow { path, service, inbound, outbound_only } => {
                 // Validate up front so a typo is an error, not a silent no-op.
                 wfp::app_id(&path)?;
                 if let Some(s) = &service {
@@ -159,6 +213,11 @@ impl Core {
                 }
                 let mut new = self.cfg.clone();
                 let added = new.add(path.clone(), service.clone(), inbound, Source::Manual);
+                if outbound_only {
+                    if let Some(i) = new.find(&path, service.as_deref()) {
+                        new.rules[i].inbound = false;
+                    }
+                }
                 self.commit(new)?;
                 self.blocked.retain(|_, b| !b.path.eq_ignore_ascii_case(&path));
                 log(&format!("allowed {path} (service {service:?}, inbound {inbound})"));
@@ -211,7 +270,10 @@ impl Core {
         if self.port_cache.len() > 4096 {
             self.port_cache.retain(|_, (at, _)| now.duration_since(*at) < PORT_CACHE_TTL);
         }
+        // The lookup happens after the fact, so the port may already belong to
+        // someone else; an owner that is not a service host is certainly wrong.
         let services = win::pid_for_port(ev.protocol, ev.v6, ev.local_port)
+            .filter(|&pid| win::process_path(pid).is_some_and(|p| win::is_svchost(&p)))
             .and_then(|pid| win::services_by_pid().remove(&pid))
             .unwrap_or_default();
         self.port_cache.insert(key, (now, services.clone()));
@@ -255,19 +317,39 @@ impl Core {
                     ev.remote_port,
                     ev.protocol
                 );
-                if self.unresolved.len() < MAX_UNRESOLVED && !self.unresolved.contains(&note) {
-                    self.unresolved.push(note);
-                }
+                self.note_unresolved(note);
                 return;
             }
         }
         self.counters.learned_from_events += self.learn(path, services, "net event");
     }
 
+    fn note_unresolved(&mut self, note: String) {
+        if self.unresolved.len() < MAX_UNRESOLVED && !self.unresolved.contains(&note) {
+            self.unresolved.push(note);
+        }
+    }
+
+    /// Ends a timed learning period. Returns true if the mode changed.
+    fn expire_learning(&mut self) -> bool {
+        if self.cfg.mode != Mode::Learning || self.cfg.learning_until.is_none_or(|t| config::now() < t) {
+            return false;
+        }
+        let mut new = self.cfg.clone();
+        new.mode = Mode::Normal;
+        new.learning_since = None;
+        new.learning_until = None;
+        match self.commit(new) {
+            Ok(()) => log("learning period over; mode set to normal"),
+            Err(e) => log(&format!("ending the learning period: {e}")),
+        }
+        self.cfg.mode != Mode::Learning
+    }
+
     /// Learning's second source: whitelist every process that currently owns
     /// a network socket. Called periodically; does nothing outside learning.
     pub fn poll_sockets(&mut self) {
-        if self.cfg.mode != Mode::Learning {
+        if self.cfg.mode != Mode::Learning || self.expire_learning() {
             return;
         }
         // Forget handled processes now and then so a reused pid is not skipped forever.
@@ -298,6 +380,13 @@ impl Core {
     /// Whitelists `path` (or, for a shared service host, each of `services`)
     /// and returns how many rules were added.
     fn learn(&mut self, path: String, services: Vec<String>, how: &str) -> u64 {
+        // A rule that cannot be turned into a filter (a mapped drive only the
+        // user's session can see, say) would sit in the whitelist doing
+        // nothing but raising a warning on every reload.
+        if let Err(e) = wfp::app_id(&path) {
+            self.note_unresolved(format!("{path} ({e})"));
+            return 0;
+        }
         let mut new = self.cfg.clone();
         let mut added = Vec::new();
         if services.is_empty() {
@@ -374,8 +463,18 @@ pub fn run(stop: Receiver<()>) -> Result<(), String> {
     });
     let c = core.clone();
     std::thread::spawn(move || {
-        if let Err(e) = ipc::serve(|req| c.lock().unwrap().handle(req)) {
-            log(&format!("control pipe failed: {e}"));
+        // `serve` only returns when the pipe cannot be created, typically
+        // because another program holds the name. Keep trying: the name is
+        // ours again the moment that program exits.
+        let mut reported = false;
+        loop {
+            if let Err(e) = ipc::serve(|req| c.lock().unwrap().handle(req)) {
+                if !reported {
+                    log(&format!("control pipe unavailable ({e}); the firewall keeps running, retrying"));
+                    reported = true;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
         }
     });
 
@@ -474,13 +573,26 @@ fn wait_stopped(service: &windows_service::service::Service) -> Result<(), Strin
 
 /// Copies the binary into Program Files (so the service never runs from a
 /// user-writable folder), registers the service and starts it.
-pub fn install() -> Result<String, String> {
+///
+/// With `learning`, a machine that has no configuration yet starts out in
+/// learning mode; an existing configuration is never touched.
+pub fn install(learning: bool) -> Result<String, String> {
     let scm = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP;
+    let access = ServiceAccess::QUERY_STATUS
+        | ServiceAccess::START
+        | ServiceAccess::STOP
+        | ServiceAccess::CHANGE_CONFIG;
     let existing = scm.open_service(SERVICE_NAME, access).ok();
     if let Some(service) = &existing {
         let _ = service.stop();
         wait_stopped(service)?;
+    }
+
+    // Lock the data directory down before anything is written to it.
+    Config::secure_dir()?.iter().for_each(|note| eprintln!("warning: {note}"));
+    if learning && !Config::file().exists() {
+        let cfg = Config { mode: Mode::Learning, learning_since: Some(config::now()), ..Config::default() };
+        cfg.save().map_err(|e| format!("writing the initial configuration: {e}"))?;
     }
 
     let target = installed_exe();
@@ -510,8 +622,26 @@ pub fn install() -> Result<String, String> {
             service
         }
     };
+    // The filters live only as long as the process does, so a service that
+    // dies must come straight back rather than leave the machine unfiltered.
+    let restart = |secs| ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(secs) };
+    let recovery = service
+        .update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart(1), restart(5), restart(30)]),
+        })
+        .and_then(|()| service.set_failure_actions_on_non_crash_failures(true));
     service.start::<&str>(&[]).map_err(|e| format!("installed, but starting failed: {}", describe(&e)))?;
-    Ok(format!("installed and started ({})", target.display()))
+    Ok(match recovery {
+        Ok(()) => format!("installed and started ({})", target.display()),
+        Err(e) => format!(
+            "installed and started ({}), but automatic restart after a crash could not be configured: {}",
+            target.display(),
+            describe(&e)
+        ),
+    })
 }
 
 fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {

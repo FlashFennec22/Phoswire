@@ -3,7 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ptr::{null, null_mut};
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, NO_ERROR,
@@ -16,10 +18,16 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
     MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+    GetSecurityInfo, SetNamedSecurityInfoW, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
-use windows_sys::Win32::Security::LookupAccountNameW;
+use windows_sys::Win32::Security::{
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid, LookupAccountNameW,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+};
 use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, EnumServicesStatusExW, OpenSCManagerW, ENUM_SERVICE_STATUS_PROCESSW,
@@ -33,6 +41,7 @@ pub const IPPROTO_ICMPV6: u8 = 58;
 const AF_INET: u32 = 2;
 const AF_INET6: u32 = 23;
 const SDDL_REVISION_1: u32 = 1;
+const SERVICE_USERSERVICE_INSTANCE: u32 = 0x80;
 
 /// NUL-terminated UTF-16.
 pub fn wide(s: &str) -> Vec<u16> {
@@ -58,8 +67,32 @@ pub fn last_error() -> u32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32
 }
 
+/// `%SystemRoot%\System32\svchost.exe`, the shared Windows service host.
+pub fn system_svchost() -> String {
+    format!(
+        "{}\\System32\\svchost.exe",
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into())
+    )
+}
+
+/// True only for the real service host, not any file that shares its name.
 pub fn is_svchost(path: &str) -> bool {
-    path.to_ascii_lowercase().ends_with("\\svchost.exe")
+    path.eq_ignore_ascii_case(&system_svchost())
+}
+
+/// True when `path` is somewhere ordinary users cannot write by default, so
+/// the file a rule trusts cannot simply be swapped for another one.
+pub fn in_protected_dir(path: &str) -> bool {
+    if path.eq_ignore_ascii_case(crate::config::SYSTEM_APP) {
+        return true;
+    }
+    let lower = path.to_ascii_lowercase();
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"].iter().any(|var| {
+        std::env::var(var).is_ok_and(|dir| {
+            let dir = dir.to_ascii_lowercase();
+            lower.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('\\'))
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +136,11 @@ pub fn dos_to_nt(path: &str) -> Option<String> {
 /// Converts the NT device path WFP reports (`\device\harddiskvolume3\...`)
 /// into a drive-letter path. Anything else (e.g. `System`) is returned as is.
 pub fn nt_to_dos(nt: &str) -> String {
-    static MAP: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    // Drive letters get reassigned (removable media), so the map expires.
+    const MAX_AGE: Duration = Duration::from_secs(30);
+    const MISS_REFRESH: Duration = Duration::from_secs(5);
+    type DriveMap = (Option<Instant>, Vec<(String, String)>);
+    static MAP: Mutex<DriveMap> = Mutex::new((None, Vec::new()));
     if !nt.starts_with('\\') {
         return nt.to_string();
     }
@@ -114,13 +151,36 @@ pub fn nt_to_dos(nt: &str) -> String {
             rest.starts_with('\\').then(|| format!("{}{}", drive, &nt[dev.len()..]))
         })
     };
-    let mut map = MAP.lock().unwrap();
-    if let Some(p) = lookup(&map) {
+    let mut guard = MAP.lock().unwrap();
+    let age = guard.0.map(|at| at.elapsed());
+    if age.is_none_or(|a| a > MAX_AGE) {
+        *guard = (Some(Instant::now()), device_map());
+    }
+    if let Some(p) = lookup(&guard.1) {
         return p;
     }
-    // Unknown volume: drives may have been mounted since the map was built.
-    *map = device_map();
-    lookup(&map).unwrap_or_else(|| nt.to_string())
+    // Unknown volume: it may have been mounted since the map was built. Paths
+    // with no drive letter at all (network shares) must not rebuild it every time.
+    if age.is_some_and(|a| a > MISS_REFRESH && a <= MAX_AGE) {
+        *guard = (Some(Instant::now()), device_map());
+        if let Some(p) = lookup(&guard.1) {
+            return p;
+        }
+    }
+    nt.to_string()
+}
+
+/// The NT device path of something that has no drive letter: an NT path is
+/// passed through, and `\\server\share\app.exe` becomes
+/// `\device\mup\server\share\app.exe`. Never touches the file, so the
+/// service does not authenticate to a remote server just to build a rule.
+pub fn device_path(path: &str) -> Option<String> {
+    let lower = path.to_lowercase();
+    if lower.starts_with("\\device\\") {
+        return Some(lower);
+    }
+    let unc = lower.strip_prefix("\\\\")?;
+    (!unc.starts_with(['?', '.'])).then(|| format!("\\device\\mup\\{unc}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +205,94 @@ pub fn sddl_to_sd(sddl: &str) -> Result<Vec<u8>, String> {
     let bytes = unsafe { std::slice::from_raw_parts(sd as *const u8, len as usize).to_vec() };
     unsafe { LocalFree(sd) };
     Ok(bytes)
+}
+
+fn sid_trusted(sid: PSID) -> bool {
+    !sid.is_null()
+        && unsafe {
+            IsWellKnownSid(sid, WinLocalSystemSid) != 0 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+        }
+}
+
+/// True when the file or directory is owned by SYSTEM or Administrators,
+/// i.e. it was not planted by an unprivileged user.
+pub fn path_owner_trusted(path: &Path) -> bool {
+    let mut owner: PSID = null_mut();
+    let mut sd = null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide(&path.to_string_lossy()).as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != NO_ERROR {
+        return false;
+    }
+    let trusted = sid_trusted(owner);
+    unsafe { LocalFree(sd) };
+    trusted
+}
+
+/// Same check for an open kernel object such as a named pipe. `Err` carries
+/// the Win32 error when the owner could not be read at all.
+pub fn handle_owner_trusted(handle: HANDLE) -> Result<bool, u32> {
+    let mut owner: PSID = null_mut();
+    let mut sd = null_mut();
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != NO_ERROR {
+        return Err(rc);
+    }
+    let trusted = sid_trusted(owner);
+    unsafe { LocalFree(sd) };
+    Ok(trusted)
+}
+
+/// Gives a directory to Administrators and replaces its permissions with
+/// "SYSTEM and Administrators only", cutting off what it inherited from its
+/// parent. Windows re-derives the permissions of everything inside it.
+pub fn lock_down(dir: &Path) -> Result<(), String> {
+    let mut sd = sddl_to_sd("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")?;
+    let name = wide(&dir.to_string_lossy());
+    unsafe {
+        let (mut owner, mut owner_defaulted): (PSID, i32) = (null_mut(), 0);
+        let (mut dacl, mut present, mut dacl_defaulted): (*mut ACL, i32, i32) = (null_mut(), 0, 0);
+        if GetSecurityDescriptorOwner(sd.as_mut_ptr().cast(), &mut owner, &mut owner_defaulted) == 0
+            || GetSecurityDescriptorDacl(sd.as_mut_ptr().cast(), &mut present, &mut dacl, &mut dacl_defaulted) == 0
+            || present == 0
+        {
+            return Err(format!("cannot build permissions for {}", dir.display()));
+        }
+        let rc = SetNamedSecurityInfoW(
+            name.as_ptr() as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner,
+            null_mut(),
+            dacl,
+            null_mut(),
+        );
+        if rc != NO_ERROR {
+            return Err(format!("cannot restrict {} to administrators (error {rc})", dir.display()));
+        }
+    }
+    Ok(())
 }
 
 /// The `S-1-5-80-…` SID of a Windows service.
@@ -352,7 +500,11 @@ pub fn services_by_pid() -> HashMap<u32, Vec<String>> {
             );
             for e in entries {
                 let pid = e.ServiceStatusProcess.dwProcessId;
-                if pid != 0 {
+                // Per-user service instances ("CDPUserSvc_1a2b3") get a new
+                // name, and so a new SID, at every logon; a rule for one
+                // would be dead by the next session.
+                let per_user = e.ServiceStatusProcess.dwServiceType & SERVICE_USERSERVICE_INSTANCE != 0;
+                if pid != 0 && !per_user {
                     out.entry(pid).or_default().push(from_wide_ptr(e.lpServiceName));
                 }
             }

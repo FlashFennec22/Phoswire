@@ -8,7 +8,7 @@
 ; the service at %ProgramFiles%\Phoswire\phoswire.exe.
 
 #define AppName "Phoswire"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define AppExe "phoswire.exe"
 
 [Setup]
@@ -41,9 +41,6 @@ Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: path; Check: NeedsAddPath(ExpandConstant('{app}'))
-
-[Run]
-Filename: "{app}\{#AppExe}"; Parameters: "install"; StatusMsg: "Registering and starting the Phoswire service..."; Flags: runhidden; BeforeInstall: WriteInitialConfig
 
 [UninstallRun]
 Filename: "{app}\{#AppExe}"; Parameters: "uninstall"; Flags: runhidden; RunOnceId: "RemovePhoswireService"
@@ -104,14 +101,33 @@ begin
     Exec(Exe, 'stop', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
-{ Runs just before the service is registered and started. }
-procedure WriteInitialConfig;
+{ Registers and starts the service once the files are in place.
+
+  `phoswire install` itself creates the data folder, restricted to SYSTEM and
+  Administrators, and writes the initial configuration; setup must not create
+  that folder, because one made here would inherit ProgramData's permissions,
+  which let any user add files to it.
+
+  The result is checked: a firewall that silently failed to install is worse
+  than an installer that says so. }
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Params: String;
+  Code: Integer;
+  Started: Boolean;
 begin
-  if WizardIsTaskSelected('learning') and IsFreshInstall then
-  begin
-    ForceDirectories(ExtractFileDir(ConfigFile));
-    SaveStringToFile(ConfigFile, '{"mode":"learning","rules":[]}', False);
-  end;
+  if CurStep <> ssPostInstall then
+    exit;
+  Params := 'install';
+  if WizardIsTaskSelected('learning') then
+    Params := Params + ' --learning';
+  WizardForm.StatusLabel.Caption := 'Registering and starting the Phoswire service...';
+  Started := Exec(ExpandConstant('{app}\{#AppExe}'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
+  if (not Started) or (Code <> 0) then
+    SuppressibleMsgBox(
+      'The Phoswire service could not be installed or started, so this computer is NOT being filtered.' + #13#10#13#10 +
+      'Open an elevated terminal and run "phoswire install" to see the reason.',
+      mbCriticalError, MB_OK, IDOK);
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
