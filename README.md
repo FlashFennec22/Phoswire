@@ -19,6 +19,10 @@ Phoswire barely exists from a system resources perspective, taking up just over 
 
 Strictly command line at this time. I would prefer to keep the service as slim and trim as possible.
 
+## How do I use it?
+
+Type **phoswire** into an elevated terminal after installing for a list of commands. If you don't know what this means, I would advise against using it for now.
+
 ## What it does and does not protect against
 
 Phoswire blocks every connection unless the program making it is on the whitelist. It sits alongside Windows Firewall: traffic has to be accepted by both.
