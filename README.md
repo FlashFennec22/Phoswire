@@ -7,6 +7,10 @@ Currently usable only via the terminal. Has a learning mode for easy deployment.
 
 Most successful malware these days will expressly target the standard Windows security suite in some fashion or another. Phoswire is intended as a failsafe in the event that those systems are somehow compromised, ideally buying time for an attack to be recognized and mitigated. It also provides a relatively simple way for users to exert control over which applications can or cannot access the internet.
 
+## Is there an installer?
+
+Check the releases page: https://github.com/FlashFennec22/Phoswire/releases
+
 ## What does the learning mode do?
 
 Learning Mode is intended to be engaged once and never again; preferably on a clean system during setup. It automatically whitelists outbound traffic for any application attempting to access the internet while it's on. Once it's turned off, a user should manually whitelist any new applications they want to add. **For this reason, Phoswire works best for relatively static deployments. Users who add new software frequently may find it inconvenient.**
