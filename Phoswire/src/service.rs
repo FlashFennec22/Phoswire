@@ -32,6 +32,12 @@ const SOCKET_POLL: Duration = Duration::from_millis(250);
 const EVENT_QUEUE: usize = 4096;
 /// Learning left on this long without an end time earns a warning in `status`.
 const LEARNING_NAG_SECS: u64 = 24 * 3600;
+/// How long the service may take to get its filters in place.
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a failed attempt to end the learning period is repeated.
+const EXPIRE_RETRY: Duration = Duration::from_secs(30);
+/// How often the installed filters are checked against the engine.
+const FILTER_CHECK: Duration = Duration::from_secs(30);
 
 /// Set once the data directory has been verified; until then nothing is
 /// written there, because it may be under an unprivileged user's control.
@@ -51,6 +57,10 @@ pub fn log(msg: &str) {
     }
 }
 
+fn allow_events_marker() -> PathBuf {
+    Config::dir().join("allow-events.ours")
+}
+
 // ---------------------------------------------------------------------------
 // Core
 // ---------------------------------------------------------------------------
@@ -67,10 +77,23 @@ pub struct Core {
     polled: HashSet<u32>,
     polled_reset: Instant,
     counters: Counters,
+    /// Why the data directory cannot be trusted. While set, nothing is read
+    /// from or written to it and the configuration lives in memory only.
+    storage_problem: Option<String>,
+    /// A change was applied but deliberately not saved (see `storage_problem`).
+    unsaved: bool,
+    /// Why the last attempt to end the learning period failed, and when to
+    /// try again.
+    expire_error: Option<String>,
+    expire_retry: Option<Instant>,
+    filters_checked: Instant,
+    /// The last attempt to reinstall missing filters failed (logged once).
+    repair_failed: bool,
 }
 
 impl Core {
     pub fn start() -> Result<(Core, Receiver<NetEvent>), String> {
+        let mut storage_problem = None;
         let mut cfg = match Config::secure_dir() {
             Ok(notes) => {
                 LOG_TO_FILE.store(true, Ordering::Relaxed);
@@ -87,15 +110,32 @@ impl Core {
             }
             Err(e) => {
                 // Fail closed here too: a data directory someone else controls
-                // is not read from and not written to.
+                // is not read from and not written to (`commit` checks this).
                 log(&format!("{e}; starting with an empty whitelist that will not be saved"));
+                storage_problem = Some(e);
                 Config::default()
             }
         };
+        if cfg.mode == Mode::Learning && cfg.learning_until.is_some_and(|t| config::now() >= t) {
+            // The period ran out while the service was down. Switch before any
+            // filter is installed, so outbound is not reopened even briefly.
+            cfg.mode = Mode::Normal;
+            cfg.learning_since = None;
+            cfg.learning_until = None;
+            log("the learning period ended while the service was not running; mode set to normal");
+            if let Err(e) = cfg.save() {
+                log(&format!("saving the config failed: {e}"));
+            }
+        }
         if cfg.mode == Mode::Learning && cfg.learning_since.is_none() {
             cfg.learning_since = Some(config::now());
         }
         let mut engine = Engine::open()?;
+        if storage_problem.is_none() && allow_events_marker().exists() {
+            // A previous run turned on the reporting of allowed connections
+            // and died before turning it off; `reapply` below now will.
+            engine.adopt_allow_events();
+        }
         let (tx, rx) = mpsc::sync_channel(EVENT_QUEUE);
         if let Err(e) = engine.subscribe(tx) {
             log(&format!("{e}; learning mode and the blocked list will not work"));
@@ -110,6 +150,12 @@ impl Core {
             polled: HashSet::new(),
             polled_reset: Instant::now(),
             counters: Counters::default(),
+            storage_problem,
+            unsaved: false,
+            expire_error: None,
+            expire_retry: None,
+            filters_checked: Instant::now(),
+            repair_failed: false,
         };
         core.reapply()?;
         log(&format!(
@@ -129,7 +175,24 @@ impl Core {
         if let Err(e) = self.engine.set_allow_events(self.cfg.mode == Mode::Learning) {
             self.warnings.push(e);
         }
+        self.record_allow_events();
         Ok(())
+    }
+
+    /// Keeps a marker file for as long as the machine-wide "report allowed
+    /// connections" flag is on because of us. The flag outlives the process,
+    /// so without the marker a service that crashed while learning would
+    /// come back, find the flag on, take it for someone else's and leave it.
+    fn record_allow_events(&self) {
+        if self.storage_problem.is_some() {
+            return;
+        }
+        let marker = allow_events_marker();
+        match (self.engine.allow_events_ours(), marker.exists()) {
+            (true, false) => drop(std::fs::write(&marker, b"")),
+            (false, true) => drop(std::fs::remove_file(&marker)),
+            _ => {}
+        }
     }
 
     /// Switches to `new`, rolling back if WFP rejects it.
@@ -140,19 +203,37 @@ impl Core {
             let _ = self.reapply();
             return Err(e);
         }
+        if self.storage_problem.is_some() {
+            // The data directory is under someone else's control: writing
+            // there would let them steer where this process creates files.
+            self.unsaved = true;
+            return Ok(());
+        }
         self.cfg.save().map_err(|e| format!("applied, but saving the config failed: {e}"))
     }
 
     pub fn shutdown(&mut self) {
         let _ = self.engine.apply(&[]);
         let _ = self.engine.set_allow_events(false);
+        self.record_allow_events();
     }
 
     pub fn handle(&mut self, req: Request) -> Reply {
-        match self.handle_inner(req) {
-            Ok(reply) => reply,
-            Err(message) => Reply::Error { message },
+        self.unsaved = false;
+        match (self.handle_inner(req), &self.storage_problem) {
+            // Tell the caller when what they just changed will not survive a restart.
+            (Ok(Reply::Done { message }), Some(why)) if self.unsaved => Reply::Done {
+                message: format!("{message}\nnot saved, and lost when the service stops: {why}"),
+            },
+            (Ok(reply), _) => reply,
+            (Err(message), _) => Reply::Error { message },
         }
+    }
+
+    /// True once a timed learning period has run out but the mode has not
+    /// (yet) been switched back.
+    fn learning_overdue(&self) -> bool {
+        self.cfg.mode == Mode::Learning && self.cfg.learning_until.is_some_and(|t| config::now() >= t)
     }
 
     fn handle_inner(&mut self, req: Request) -> Result<Reply, String> {
@@ -160,6 +241,28 @@ impl Core {
         match req {
             Request::Status => {
                 let mut warnings = self.warnings.clone();
+                if let Some(why) = &self.storage_problem {
+                    warnings.push(format!(
+                        "changes are not saved and will be lost when the service stops: {why}"
+                    ));
+                }
+                // Ask the engine rather than trusting our own bookkeeping:
+                // another WFP tool may have removed filters behind our back.
+                let installed = self.engine.filter_count();
+                let missing = self.engine.missing_filters();
+                if missing > 0 {
+                    warnings.push(format!(
+                        "{missing} of {installed} filters are no longer in the Windows filter engine, so traffic is \
+                         not being filtered as configured; reinstalling them is retried every {}s",
+                        FILTER_CHECK.as_secs()
+                    ));
+                }
+                if let (true, Some(e)) = (self.learning_overdue(), &self.expire_error) {
+                    warnings.push(format!(
+                        "the learning period is over but switching to normal failed, so outbound traffic is \
+                         still open: {e}"
+                    ));
+                }
                 let learning = self.cfg.mode == Mode::Learning;
                 if learning && self.cfg.learning_until.is_none() {
                     let on_for = config::now().saturating_sub(self.cfg.learning_since.unwrap_or(u64::MAX));
@@ -176,7 +279,7 @@ impl Core {
                     learning_since: self.cfg.learning_since.filter(|_| learning),
                     learning_until: self.cfg.learning_until.filter(|_| learning),
                     rules: self.cfg.rules.len(),
-                    filters: self.engine.filter_count(),
+                    filters: installed - missing,
                     warnings,
                     unresolved: self.unresolved.clone(),
                     counters: self.counters.clone(),
@@ -195,6 +298,8 @@ impl Core {
                 new.learning_since = (mode == Mode::Learning).then_some(now);
                 new.learning_until = hours.map(|h| now + u64::from(h) * 3600);
                 self.commit(new)?;
+                self.expire_error = None;
+                self.expire_retry = None;
                 if mode == Mode::Learning {
                     self.unresolved.clear();
                     self.polled.clear();
@@ -219,7 +324,7 @@ impl Core {
                     }
                 }
                 self.commit(new)?;
-                self.blocked.retain(|_, b| !b.path.eq_ignore_ascii_case(&path));
+                self.blocked.retain(|_, b| !config::eq_ignore_case(&b.path, &path));
                 log(&format!("allowed {path} (service {service:?}, inbound {inbound})"));
                 done(if added { format!("allowed: {path}") } else { format!("already allowed: {path}") })
             }
@@ -295,7 +400,7 @@ impl Core {
         };
         let path = win::nt_to_dos(app);
         if ev.allowed {
-            if self.cfg.mode == Mode::Learning && !layer.is_inbound() {
+            if self.cfg.mode == Mode::Learning && !layer.is_inbound() && !self.learning_overdue() {
                 self.learn_event(&ev, path);
             }
         } else if self.engine.is_default_block(ev.filter_id) {
@@ -330,26 +435,77 @@ impl Core {
         }
     }
 
-    /// Ends a timed learning period. Returns true if the mode changed.
-    fn expire_learning(&mut self) -> bool {
-        if self.cfg.mode != Mode::Learning || self.cfg.learning_until.is_none_or(|t| config::now() < t) {
-            return false;
+    /// Ends a learning period whose time is up. If WFP refuses the switch, the
+    /// attempt is repeated every `EXPIRE_RETRY` and reported in `status`;
+    /// nothing more is learned in the meantime.
+    fn expire_learning(&mut self) {
+        let now = Instant::now();
+        if self.expire_retry.is_some_and(|at| now < at) {
+            return;
         }
         let mut new = self.cfg.clone();
         new.mode = Mode::Normal;
         new.learning_since = None;
         new.learning_until = None;
-        match self.commit(new) {
+        let result = self.commit(new);
+        // `commit` can fail after the switch itself went through (saving).
+        let still_learning = self.cfg.mode == Mode::Learning;
+        match result {
             Ok(()) => log("learning period over; mode set to normal"),
-            Err(e) => log(&format!("ending the learning period: {e}")),
+            Err(e) => {
+                // Say it once, not on every retry.
+                if self.expire_error.as_deref() != Some(e.as_str()) {
+                    log(&format!("ending the learning period: {e}"));
+                }
+                self.expire_error = Some(e);
+            }
         }
-        self.cfg.mode != Mode::Learning
+        if !still_learning {
+            self.expire_error = None;
+        }
+        self.expire_retry = still_learning.then(|| now + EXPIRE_RETRY);
     }
 
-    /// Learning's second source: whitelist every process that currently owns
-    /// a network socket. Called periodically; does nothing outside learning.
-    pub fn poll_sockets(&mut self) {
-        if self.cfg.mode != Mode::Learning || self.expire_learning() {
+    /// Housekeeping, called a few times a second.
+    pub fn tick(&mut self) {
+        self.check_filters();
+        self.poll_sockets();
+    }
+
+    /// Reinstalls the filters if something else removed any of them from the
+    /// engine; until that works, `status` reports them as missing.
+    fn check_filters(&mut self) {
+        if self.filters_checked.elapsed() < FILTER_CHECK {
+            return;
+        }
+        self.filters_checked = Instant::now();
+        let missing = self.engine.missing_filters();
+        if missing == 0 {
+            self.repair_failed = false;
+            return;
+        }
+        match self.reapply() {
+            Ok(()) => {
+                log(&format!("{missing} filter(s) had been removed from the filter engine; reinstalled"));
+                self.repair_failed = false;
+            }
+            Err(e) => {
+                if !self.repair_failed {
+                    log(&format!("{missing} filter(s) are missing from the filter engine and reinstalling failed: {e}"));
+                }
+                self.repair_failed = true;
+            }
+        }
+    }
+
+    /// Learning's second source: whitelist every process that currently holds
+    /// a connection to another machine. Does nothing outside learning.
+    fn poll_sockets(&mut self) {
+        if self.cfg.mode != Mode::Learning {
+            return;
+        }
+        if self.learning_overdue() {
+            self.expire_learning();
             return;
         }
         // Forget handled processes now and then so a reused pid is not skipped forever.
@@ -450,9 +606,11 @@ impl Core {
     }
 }
 
-/// Runs the firewall until `stop` fires (or forever if its sender is kept alive).
-pub fn run(stop: Receiver<()>) -> Result<(), String> {
+/// Runs the firewall until `stop` fires (or forever if its sender is kept
+/// alive). `ready` is called once the filters are in place.
+pub fn run(stop: Receiver<()>, ready: impl FnOnce()) -> Result<(), String> {
     let (core, events) = Core::start()?;
+    ready();
     let core = Arc::new(Mutex::new(core));
 
     let c = core.clone();
@@ -481,7 +639,7 @@ pub fn run(stop: Receiver<()>) -> Result<(), String> {
     let c = core.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(SOCKET_POLL);
-        c.lock().unwrap().poll_sockets();
+        c.lock().unwrap().tick();
     });
 
     let _ = stop.recv();
@@ -519,32 +677,36 @@ fn service_body() -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
 
-    let status = |state, accept, exit| ServiceStatus {
-        service_type: ServiceType::OWN_PROCESS,
-        current_state: state,
-        controls_accepted: accept,
-        exit_code: ServiceExitCode::Win32(exit),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
-        process_id: None,
+    let status = |state, exit| {
+        let (starting, running) = (state == ServiceState::StartPending, state == ServiceState::Running);
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: if running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            },
+            exit_code: ServiceExitCode::Win32(exit),
+            checkpoint: u32::from(starting),
+            wait_hint: if starting { START_TIMEOUT } else { Duration::default() },
+            process_id: None,
+        }
     };
-    handle
-        .set_service_status(status(
-            ServiceState::Running,
-            ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-            0,
-        ))
-        .map_err(|e| e.to_string())?;
-
-    let result = run(stop_rx);
+    // "Running" is a promise that the machine is being filtered, so it is
+    // only reported once the filters are in place; `install` and `start`
+    // wait for it, and a service that fails before that is seen to fail.
+    handle.set_service_status(status(ServiceState::StartPending, 0)).map_err(|e| e.to_string())?;
+    let result = run(stop_rx, || {
+        let _ = handle.set_service_status(status(ServiceState::Running, 0));
+    });
     let exit = if result.is_ok() { 0 } else { 1 };
-    let _ = handle.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), exit));
+    let _ = handle.set_service_status(status(ServiceState::Stopped, exit));
     result
 }
 
 fn installed_exe() -> PathBuf {
-    let base = std::env::var_os("ProgramFiles").unwrap_or_else(|| "C:\\Program Files".into());
-    PathBuf::from(base).join("Phoswire").join("phoswire.exe")
+    PathBuf::from(win::program_files()).join("Phoswire").join("phoswire.exe")
 }
 
 fn manager(access: ServiceManagerAccess) -> Result<ServiceManager, String> {
@@ -571,12 +733,36 @@ fn wait_stopped(service: &windows_service::service::Service) -> Result<(), Strin
     Err("the service did not stop in time".into())
 }
 
+/// Waits until the service reports that its filters are in place.
+fn wait_running(service: &windows_service::service::Service) -> Result<(), String> {
+    let log = Config::dir().join("phoswire.log");
+    let deadline = Instant::now() + START_TIMEOUT;
+    while Instant::now() < deadline {
+        match service.query_status() {
+            Ok(s) if s.current_state == ServiceState::Running => return Ok(()),
+            Ok(s) if s.current_state == ServiceState::Stopped => {
+                return Err(format!(
+                    "the service stopped while starting, so this computer is NOT being filtered; see {}",
+                    log.display()
+                ))
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => return Err(describe(&e)),
+        }
+    }
+    Err(format!(
+        "the service has not finished starting, so this computer may not be filtered yet; see {}",
+        log.display()
+    ))
+}
+
 /// Copies the binary into Program Files (so the service never runs from a
 /// user-writable folder), registers the service and starts it.
 ///
 /// With `learning`, a machine that has no configuration yet starts out in
-/// learning mode; an existing configuration is never touched.
-pub fn install(learning: bool) -> Result<String, String> {
+/// learning mode, reverting to normal after `hours` if given; an existing
+/// configuration is never touched.
+pub fn install(learning: bool, hours: Option<u32>) -> Result<String, String> {
     let scm = manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     let access = ServiceAccess::QUERY_STATUS
         | ServiceAccess::START
@@ -591,7 +777,13 @@ pub fn install(learning: bool) -> Result<String, String> {
     // Lock the data directory down before anything is written to it.
     Config::secure_dir()?.iter().for_each(|note| eprintln!("warning: {note}"));
     if learning && !Config::file().exists() {
-        let cfg = Config { mode: Mode::Learning, learning_since: Some(config::now()), ..Config::default() };
+        let now = config::now();
+        let cfg = Config {
+            mode: Mode::Learning,
+            learning_since: Some(now),
+            learning_until: hours.map(|h| now + u64::from(h) * 3600),
+            ..Config::default()
+        };
         cfg.save().map_err(|e| format!("writing the initial configuration: {e}"))?;
     }
 
@@ -634,6 +826,7 @@ pub fn install(learning: bool) -> Result<String, String> {
         })
         .and_then(|()| service.set_failure_actions_on_non_crash_failures(true));
     service.start::<&str>(&[]).map_err(|e| format!("installed, but starting failed: {}", describe(&e)))?;
+    wait_running(&service).map_err(|e| format!("installed, but {e}"))?;
     Ok(match recovery {
         Ok(()) => format!("installed and started ({})", target.display()),
         Err(e) => format!(
@@ -671,9 +864,10 @@ pub fn uninstall() -> Result<String, String> {
 pub fn start() -> Result<String, String> {
     let scm = manager(ServiceManagerAccess::CONNECT)?;
     let service = scm
-        .open_service(SERVICE_NAME, ServiceAccess::START)
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::START)
         .map_err(|e| format!("cannot open the service: {}", describe(&e)))?;
     service.start::<&str>(&[]).map_err(|e| describe(&e))?;
+    wait_running(&service)?;
     Ok("started".into())
 }
 

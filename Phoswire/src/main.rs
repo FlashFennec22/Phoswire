@@ -27,6 +27,9 @@ enum Command {
         /// On a machine with no configuration yet, start in learning mode
         #[arg(long)]
         learning: bool,
+        /// With --learning: switch to normal by itself after this many hours
+        #[arg(long, requires = "learning", value_parser = clap::value_parser!(u32).range(1..))]
+        hours: Option<u32>,
     },
     /// Stop and remove the service (elevated)
     Uninstall,
@@ -90,7 +93,7 @@ fn main() -> ExitCode {
 
 fn run(command: Command) -> Result<(), String> {
     let request = match command {
-        Command::Install { learning } => return service::install(learning).map(|m| println!("{m}")),
+        Command::Install { learning, hours } => return service::install(learning, hours).map(|m| println!("{m}")),
         Command::Uninstall => return service::uninstall().map(|m| println!("{m}")),
         Command::Start => return service::start().map(|m| println!("{m}")),
         Command::Stop => return service::stop().map(|m| println!("{m}")),
@@ -99,7 +102,7 @@ fn run(command: Command) -> Result<(), String> {
             println!("Phoswire running in the foreground; press Ctrl+C to stop and remove its filters.");
             // Keep the sender alive so the firewall runs until the process is killed.
             let (_keep, stop) = std::sync::mpsc::channel();
-            return service::run(stop);
+            return service::run(stop, || println!("Filters are in place."));
         }
         Command::Status => Request::Status,
         Command::Mode { mode, hours } => Request::SetMode { mode, hours },
@@ -209,7 +212,7 @@ fn print_reply(reply: Reply) -> Result<(), String> {
                 if r.inbound {
                     tags.push("inbound".into());
                 }
-                if !win::in_protected_dir(&r.path) {
+                if !win::path_protected(&r.path) {
                     tags.push("unprotected path".into());
                     unprotected = true;
                 }
@@ -217,8 +220,9 @@ fn print_reply(reply: Reply) -> Result<(), String> {
             }
             if unprotected {
                 println!();
-                println!("Rules trust a path, not a file. \"unprotected path\" marks a rule outside Program Files and");
-                println!("Windows, where a program without administrator rights could replace the trusted file.");
+                println!("Rules trust a path, not a file. \"unprotected path\" marks a rule whose file a program without");
+                println!("administrator rights could replace: one outside Program Files and Windows, or in a folder");
+                println!("there that ordinary users are allowed to write to.");
             }
         }
         Reply::Blocked { entries } => {
@@ -239,4 +243,21 @@ fn print_reply(reply: Reply) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_hours_needs_learning_and_a_real_duration() {
+        let parse = |args: &[&str]| Cli::try_parse_from([&["phoswire", "install"], args].concat());
+        assert!(matches!(
+            parse(&["--learning", "--hours", "24"]).map(|c| c.command),
+            Ok(Command::Install { learning: true, hours: Some(24) })
+        ));
+        assert!(matches!(parse(&[]).map(|c| c.command), Ok(Command::Install { learning: false, hours: None })));
+        assert!(parse(&["--hours", "24"]).is_err());
+        assert!(parse(&["--learning", "--hours", "0"]).is_err());
+    }
 }

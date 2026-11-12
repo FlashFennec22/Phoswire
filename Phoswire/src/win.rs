@@ -4,8 +4,16 @@
 use std::collections::{HashMap, HashSet};
 use std::ptr::{null, null_mut};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+use windows_sys::core::GUID;
+use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+use windows_sys::Win32::UI::Shell::{
+    SHGetKnownFolderPath, FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64,
+    FOLDERID_ProgramFilesX86,
+};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_MORE_DATA, NO_ERROR,
@@ -24,9 +32,10 @@ use windows_sys::Win32::Security::Authorization::{
     GetSecurityInfo, SetNamedSecurityInfoW, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, IsWellKnownSid, LookupAccountNameW,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL, DACL_SECURITY_INFORMATION,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
+    AclSizeInformation, GetAce, GetAclInformation, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    IsWellKnownSid, LookupAccountNameW, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+    ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
 use windows_sys::Win32::System::Services::{
@@ -67,12 +76,52 @@ pub fn last_error() -> u32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32
 }
 
-/// `%SystemRoot%\System32\svchost.exe`, the shared Windows service host.
+// ---------------------------------------------------------------------------
+// System folders
+// ---------------------------------------------------------------------------
+//
+// These are asked of Windows, never read from environment variables. The
+// elevated CLI inherits its environment from the unelevated user, who could
+// otherwise point `ProgramFiles` at a folder of their own and have the
+// service installed there, to run whatever they then put in it as SYSTEM.
+
+fn known_folder(id: &GUID) -> Option<String> {
+    let mut path = null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(id, 0, null_mut(), &mut path) };
+    let found = (hr >= 0 && !path.is_null()).then(|| unsafe { from_wide_ptr(path) });
+    unsafe { CoTaskMemFree(path.cast()) };
+    found.filter(|p| !p.is_empty())
+}
+
+/// `C:\Program Files`
+pub fn program_files() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| known_folder(&FOLDERID_ProgramFiles).unwrap_or_else(|| r"C:\Program Files".into()))
+}
+
+/// `C:\ProgramData`
+pub fn program_data() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| known_folder(&FOLDERID_ProgramData).unwrap_or_else(|| r"C:\ProgramData".into()))
+}
+
+/// `C:\Windows`
+pub fn windows_dir() -> &'static str {
+    static DIR: OnceLock<String> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let mut buf = [0u16; 260];
+        let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 || n >= buf.len() {
+            r"C:\Windows".into()
+        } else {
+            String::from_utf16_lossy(&buf[..n])
+        }
+    })
+}
+
+/// `C:\Windows\System32\svchost.exe`, the shared Windows service host.
 pub fn system_svchost() -> String {
-    format!(
-        "{}\\System32\\svchost.exe",
-        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into())
-    )
+    format!("{}\\System32\\svchost.exe", windows_dir())
 }
 
 /// True only for the real service host, not any file that shares its name.
@@ -80,19 +129,37 @@ pub fn is_svchost(path: &str) -> bool {
     path.eq_ignore_ascii_case(&system_svchost())
 }
 
-/// True when `path` is somewhere ordinary users cannot write by default, so
-/// the file a rule trusts cannot simply be swapped for another one.
-pub fn in_protected_dir(path: &str) -> bool {
+/// True when `path` is under Program Files or Windows, where ordinary users
+/// cannot write by default.
+fn in_protected_dir(path: &str) -> bool {
+    static DIRS: OnceLock<Vec<String>> = OnceLock::new();
+    let dirs = DIRS.get_or_init(|| {
+        let mut dirs = vec![program_files().to_string(), windows_dir().to_string()];
+        dirs.extend(known_folder(&FOLDERID_ProgramFilesX86));
+        dirs.extend(known_folder(&FOLDERID_ProgramFilesX64));
+        dirs.iter().map(|d| d.to_ascii_lowercase()).collect()
+    });
+    let lower = path.to_ascii_lowercase();
+    dirs.iter().any(|dir| lower.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('\\')))
+}
+
+/// True when a program without administrator rights cannot put a different
+/// file at `path`, so the file a rule trusts cannot simply be swapped.
+///
+/// Being under Program Files or Windows is not enough: both contain folders
+/// any user can write to (`C:\Windows\Temp`, badly installed applications),
+/// so the permissions of the file and of its folder are checked as well.
+pub fn path_protected(path: &str) -> bool {
     if path.eq_ignore_ascii_case(crate::config::SYSTEM_APP) {
         return true;
     }
-    let lower = path.to_ascii_lowercase();
-    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"].iter().any(|var| {
-        std::env::var(var).is_ok_and(|dir| {
-            let dir = dir.to_ascii_lowercase();
-            lower.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('\\'))
-        })
-    })
+    if !in_protected_dir(path) {
+        return false;
+    }
+    // A file that is missing or cannot be examined is judged by where it is.
+    let open = |p: &Path| open_to_unprivileged(p).unwrap_or(false);
+    let file = Path::new(path);
+    !(open(file) || file.parent().is_some_and(open))
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +279,82 @@ fn sid_trusted(sid: PSID) -> bool {
         && unsafe {
             IsWellKnownSid(sid, WinLocalSystemSid) != 0 || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
         }
+}
+
+/// SYSTEM, Administrators or TrustedInstaller (which owns Windows itself).
+fn sid_privileged(sid: PSID) -> bool {
+    const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+    if sid_trusted(sid) {
+        return true;
+    }
+    let mut text = null_mut();
+    if sid.is_null() || unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return false;
+    }
+    let s = unsafe { from_wide_ptr(text) };
+    unsafe { LocalFree(text.cast()) };
+    s == TRUSTED_INSTALLER
+}
+
+/// True when the permissions let an account other than the privileged ones
+/// change, replace or delete the object (for a folder: add or remove files).
+///
+/// # Safety
+/// `dacl` must be null or point to a valid ACL.
+pub unsafe fn dacl_open_to_unprivileged(dacl: *const ACL) -> bool {
+    // FILE_WRITE_DATA / ADD_FILE, FILE_APPEND_DATA / ADD_SUBDIRECTORY,
+    // FILE_DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE.
+    const WRITE: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const INHERIT_ONLY_ACE: u8 = 0x08;
+    if dacl.is_null() {
+        return true; // no permissions at all: everyone has full access
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let size = std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32;
+    if GetAclInformation(dacl, (&mut info as *mut ACL_SIZE_INFORMATION).cast(), size, AclSizeInformation) == 0 {
+        return false;
+    }
+    (0..info.AceCount).any(|i| {
+        let mut ace = null_mut();
+        if GetAce(dacl, i, &mut ace) == 0 {
+            return false;
+        }
+        let ace = ace as *const ACCESS_ALLOWED_ACE;
+        let header = (*ace).Header;
+        // Inherit-only entries describe what children get, not this object.
+        header.AceType == ACCESS_ALLOWED_ACE_TYPE
+            && header.AceFlags & INHERIT_ONLY_ACE == 0
+            && (*ace).Mask & WRITE != 0
+            && !sid_privileged(std::ptr::addr_of!((*ace).SidStart) as PSID)
+    })
+}
+
+/// Whether an unprivileged account owns or may modify the file or folder;
+/// `None` if it does not exist or its permissions cannot be read.
+fn open_to_unprivileged(path: &Path) -> Option<bool> {
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut sd = null_mut();
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide(&path.to_string_lossy()).as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != NO_ERROR {
+        return None;
+    }
+    // An owner can always rewrite the permissions, whatever they say now.
+    let open = !sid_privileged(owner) || unsafe { dacl_open_to_unprivileged(dacl) };
+    unsafe { LocalFree(sd) };
+    Some(open)
 }
 
 /// True when the file or directory is owned by SYSTEM or Administrators,
@@ -396,11 +539,16 @@ pub fn pid_for_port(protocol: u8, v6: bool, local_port: u16) -> Option<u32> {
     }
 }
 
-/// Processes that currently hold a non-loopback TCP connection or UDP socket.
+/// Processes that currently hold a TCP connection to another machine.
 ///
 /// This is the learner's second source: unlike WFP net events it reports the
 /// owning process directly, at the cost of missing connections that open and
 /// close between two polls.
+///
+/// UDP sockets are deliberately not counted. They have no connections, so
+/// all the table can show is that a socket exists, and trusting that would
+/// whitelist programs (and the kernel, for NetBIOS) that never sent anything.
+/// UDP traffic is learned from net events, which report actual packets.
 pub fn network_pids() -> HashSet<u32> {
     const LISTEN: u32 = 2; // MIB_TCP_STATE_LISTEN
     const V6_LOOPBACK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
@@ -426,20 +574,6 @@ pub fn network_pids() -> HashSet<u32> {
                     .filter(|r| r.dwState != LISTEN && r.ucRemoteAddr != [0; 16] && r.ucRemoteAddr != V6_LOOPBACK)
                     .map(|r| r.dwOwningPid),
             );
-        }
-        // UDP has no connections, so a socket bound to a real interface (or
-        // to every interface) is the best available sign of network use.
-        if let Some(buf) = fetch_table(|p, s| GetExtendedUdpTable(p, s, 0, AF_INET, UDP_TABLE_OWNER_PID, 0)) {
-            let t = buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID;
-            let rows: &[MIB_UDPROW_OWNER_PID] =
-                std::slice::from_raw_parts((*t).table.as_ptr(), (*t).dwNumEntries as usize);
-            pids.extend(rows.iter().filter(|r| r.dwLocalAddr & 0xff != 127).map(|r| r.dwOwningPid));
-        }
-        if let Some(buf) = fetch_table(|p, s| GetExtendedUdpTable(p, s, 0, AF_INET6, UDP_TABLE_OWNER_PID, 0)) {
-            let t = buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID;
-            let rows: &[MIB_UDP6ROW_OWNER_PID] =
-                std::slice::from_raw_parts((*t).table.as_ptr(), (*t).dwNumEntries as usize);
-            pids.extend(rows.iter().filter(|r| r.ucLocalAddr != V6_LOOPBACK).map(|r| r.dwOwningPid));
         }
     }
     pids.remove(&0);

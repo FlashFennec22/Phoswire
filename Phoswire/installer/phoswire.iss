@@ -8,8 +8,11 @@
 ; the service at %ProgramFiles%\Phoswire\phoswire.exe.
 
 #define AppName "Phoswire"
-#define AppVersion "0.2.0"
+#define AppVersion "0.3.0"
 #define AppExe "phoswire.exe"
+; Learning switched on by setup ends by itself, so a forgotten install does
+; not leave outbound traffic open for good.
+#define LearningHours "24"
 
 [Setup]
 AppId={{6C1B3F0E-52A7-4E0B-9A3D-7F1E2C4D8B90}
@@ -33,7 +36,7 @@ UninstallDisplayName={#AppName} Firewall
 CloseApplications=no
 
 [Tasks]
-Name: "learning"; Description: "Start in &learning mode (recommended; otherwise every app is blocked until you whitelist it)"; Check: IsFreshInstall
+Name: "learning"; Description: "Start in &learning mode for {#LearningHours} hours (recommended; otherwise every app is blocked until you whitelist it)"; Check: IsFreshInstall
 Name: "path"; Description: "Add Phoswire to the system &PATH so `phoswire` works from any terminal"
 
 [Files]
@@ -120,7 +123,7 @@ begin
     exit;
   Params := 'install';
   if WizardIsTaskSelected('learning') then
-    Params := Params + ' --learning';
+    Params := Params + ' --learning --hours {#LearningHours}';
   WizardForm.StatusLabel.Caption := 'Registering and starting the Phoswire service...';
   Started := Exec(ExpandConstant('{app}\{#AppExe}'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code);
   if (not Started) or (Code <> 0) then

@@ -1,6 +1,6 @@
 [package]
 name = "phoswire"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A light zero-trust application firewall for Windows, layered on the Windows Filtering Platform"
 license = "MIT"
@@ -21,11 +21,14 @@ features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_IO",
     "Win32_System_Pipes",
     "Win32_System_Rpc",
     "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
 ]
 
 [profile.release]

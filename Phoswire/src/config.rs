@@ -51,12 +51,20 @@ pub struct Rule {
     pub added: u64,
 }
 
+/// Compares names the way Windows does: ignoring case for every letter, not
+/// only ASCII ones. WFP reports paths lower-cased, so without this a program
+/// under `C:\Users\Émile` would get one rule from its events and a second
+/// from its real path, and removing either would leave the other in force.
+pub fn eq_ignore_case(a: &str, b: &str) -> bool {
+    a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
+}
+
 impl Rule {
     pub fn same_subject(&self, path: &str, service: Option<&str>) -> bool {
-        self.path.eq_ignore_ascii_case(path)
+        eq_ignore_case(&self.path, path)
             && match (self.service.as_deref(), service) {
                 (None, None) => true,
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                (Some(a), Some(b)) => eq_ignore_case(a, b),
                 _ => false,
             }
     }
@@ -90,8 +98,7 @@ impl Default for Config {
 
 impl Config {
     pub fn dir() -> PathBuf {
-        let base = std::env::var_os("ProgramData").unwrap_or_else(|| "C:\\ProgramData".into());
-        PathBuf::from(base).join("Phoswire")
+        PathBuf::from(crate::win::program_data()).join("Phoswire")
     }
 
     pub fn file() -> PathBuf {
@@ -178,8 +185,7 @@ impl Config {
     /// the whole executable.
     pub fn covers(&self, path: &str, service: Option<&str>) -> bool {
         self.rules.iter().any(|r| {
-            r.path.eq_ignore_ascii_case(path)
-                && (r.service.is_none() || r.same_subject(path, service))
+            eq_ignore_case(&r.path, path) && (r.service.is_none() || r.same_subject(path, service))
         })
     }
 
@@ -197,4 +203,26 @@ impl Config {
 
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rules_match_whatever_the_case_of_any_letter() {
+        let rule = Rule {
+            path: r"C:\Users\Émile\App\Über.exe".into(),
+            service: None,
+            inbound: false,
+            source: Source::Learned,
+            added: 0,
+        };
+        // What WFP reports for the same file.
+        assert!(rule.same_subject(r"c:\users\émile\app\über.exe", None));
+        assert!(!rule.same_subject(r"c:\users\emile\app\uber.exe", None));
+        let cfg = Config { rules: vec![rule], ..Config::default() };
+        assert!(cfg.covers(r"c:\users\émile\app\über.exe", None));
+        assert_eq!(cfg.find(r"C:\USERS\ÉMILE\APP\ÜBER.EXE", None), Some(0));
+    }
 }

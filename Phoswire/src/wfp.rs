@@ -24,6 +24,7 @@ use crate::config::{Config, Mode, SYSTEM_APP};
 use crate::win::{self, wide, IPPROTO_ICMPV6, IPPROTO_UDP};
 
 const SUBLAYER_KEY: GUID = GUID::from_u128(0x7068_6f73_7769_7265_a1f0_3c5d_9e2b_4a61);
+const FILTER_NOT_FOUND: u32 = windows_sys::Win32::Foundation::FWP_E_FILTER_NOT_FOUND as u32;
 
 const W_BLOCK: u8 = 0;
 const W_LEARN: u8 = 1;
@@ -372,6 +373,35 @@ impl Engine {
         self.filter_ids.len()
     }
 
+    /// How many of the filters we installed the engine no longer has (or can
+    /// no longer be asked about). Anything but zero means traffic is not
+    /// being filtered as configured.
+    pub fn missing_filters(&self) -> usize {
+        self.filter_ids
+            .iter()
+            .filter(|&&id| unsafe {
+                let mut filter: *mut FWPM_FILTER0 = null_mut();
+                let rc = FwpmFilterGetById0(self.handle, id, &mut filter);
+                if !filter.is_null() {
+                    FwpmFreeMemory0(&mut filter as *mut _ as *mut *mut core::ffi::c_void);
+                }
+                rc != 0
+            })
+            .count()
+    }
+
+    /// True while the machine-wide "report allowed connections" flag is on
+    /// because Phoswire turned it on.
+    pub fn allow_events_ours(&self) -> bool {
+        self.allow_events_ours
+    }
+
+    /// Takes responsibility for the flag when a previous run of the service
+    /// turned it on and died before turning it off again.
+    pub fn adopt_allow_events(&mut self) {
+        self.allow_events_ours = true;
+    }
+
     pub fn layer(&self, layer_id: u16) -> Option<Layer> {
         self.layer_ids.iter().find(|(id, _)| *id == layer_id).map(|(_, l)| *l)
     }
@@ -387,7 +417,12 @@ impl Engine {
             check("starting a transaction", FwpmTransactionBegin0(self.handle, 0))?;
             let result = (|| {
                 for &id in &self.filter_ids {
-                    check("removing a filter", FwpmFilterDeleteById0(self.handle, id))?;
+                    // A filter another tool already removed is as good as
+                    // removed; failing here would freeze the policy for good.
+                    match FwpmFilterDeleteById0(self.handle, id) {
+                        FILTER_NOT_FOUND => {}
+                        rc => check("removing a filter", rc)?,
+                    }
                 }
                 let mut ids = Vec::with_capacity(specs.len());
                 let mut blocks = HashSet::new();
@@ -579,7 +614,7 @@ mod tests {
     }
 
     fn svchost() -> String {
-        format!(r"{}\System32\svchost.exe", std::env::var("SystemRoot").unwrap())
+        win::system_svchost()
     }
 
     #[test]
@@ -659,9 +694,46 @@ mod tests {
     fn only_the_real_svchost_is_a_service_host() {
         assert!(win::is_svchost(&svchost().to_uppercase()));
         assert!(!win::is_svchost(r"C:\Users\someone\svchost.exe"));
-        assert!(win::in_protected_dir(&svchost()));
-        assert!(win::in_protected_dir(SYSTEM_APP));
-        assert!(!win::in_protected_dir(r"C:\Users\someone\AppData\Local\app\app.exe"));
+        assert!(win::path_protected(&svchost()));
+        assert!(win::path_protected(SYSTEM_APP));
+        assert!(!win::path_protected(r"C:\Users\someone\AppData\Local\app\app.exe"));
+    }
+
+    #[test]
+    fn system_folders_do_not_come_from_the_environment() {
+        // Agree with the environment on an ordinary machine...
+        let env = |name: &str| std::env::var(name).unwrap();
+        assert!(win::program_files().eq_ignore_ascii_case(&env("ProgramW6432")));
+        assert!(win::program_data().eq_ignore_ascii_case(&env("ProgramData")));
+        assert!(win::windows_dir().eq_ignore_ascii_case(&env("SystemRoot")));
+        // ...but are not taken from it.
+        std::env::set_var("ProgramData", r"C:\Users\Public\elsewhere");
+        assert!(!Config::dir().starts_with(r"C:\Users\Public"));
+    }
+
+    #[test]
+    fn permissions_decide_whether_a_path_is_protected() {
+        let open = |sddl: &str| unsafe {
+            let mut sd = win::sddl_to_sd(sddl).unwrap();
+            let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
+            let ok = windows_sys::Win32::Security::GetSecurityDescriptorDacl(
+                sd.as_mut_ptr().cast(),
+                &mut present,
+                &mut dacl,
+                &mut defaulted,
+            );
+            assert!(ok != 0 && present != 0);
+            win::dacl_open_to_unprivileged(dacl)
+        };
+        // Program Files as installed: users may read and run, nothing more.
+        assert!(!open("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;BU)"));
+        // Entries that only describe what new children inherit do not count.
+        assert!(!open("D:(A;;FA;;;BA)(A;OICIIO;GA;;;CO)(A;;0x1200a9;;;BU)"));
+        // C:\Windows\Temp: users may create files.
+        assert!(open("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x100026;;;BU)"));
+        // A badly installed application: users may modify.
+        assert!(open("D:(A;;FA;;;BA)(A;;0x1301bf;;;AU)"));
+        assert!(open("D:(A;;FA;;;BA)(A;;GA;;;WD)"));
     }
 
     #[test]
@@ -677,8 +749,7 @@ mod tests {
 
     #[test]
     fn ownership_check_tells_system_files_from_missing_ones() {
-        let program_data = std::env::var("ProgramData").unwrap();
-        assert!(win::path_owner_trusted(std::path::Path::new(&program_data)));
+        assert!(win::path_owner_trusted(std::path::Path::new(win::program_data())));
         assert!(!win::path_owner_trusted(std::path::Path::new(r"C:\no\such\phoswire\file")));
     }
 
@@ -704,10 +775,10 @@ mod tests {
         assert_eq!(win::pid_for_port(17, true, udp.local_addr().unwrap().port()), Some(me));
         assert!(win::services_by_pid().values().flatten().any(|s| s.eq_ignore_ascii_case("Dnscache")));
 
-        // The socket poller must see a socket bound to all interfaces, and
-        // resolve the owner back to this test binary.
+        // Holding a UDP socket, even one bound to every interface, is not
+        // network use: the socket poller must not report (and so whitelist) us.
         let _any = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-        assert!(win::network_pids().contains(&me));
+        assert!(!win::network_pids().contains(&me));
         let exe = std::env::current_exe().unwrap();
         assert!(win::process_path(me).unwrap().eq_ignore_ascii_case(&exe.to_string_lossy()));
         assert_eq!(win::process_path(4).as_deref(), Some(SYSTEM_APP));
