@@ -42,6 +42,9 @@ pub enum Request {
         /// Withdraw inbound access from an existing rule.
         #[serde(default)]
         outbound_only: bool,
+        /// Trust only this version of a program in a versioned folder.
+        #[serde(default)]
+        exact: bool,
     },
     Remove { path: String, service: Option<String> },
     RemoveIndex { index: usize },

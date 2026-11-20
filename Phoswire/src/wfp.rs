@@ -20,7 +20,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
-use crate::config::{Config, Mode, SYSTEM_APP};
+use crate::config::{self, Config, Mode, Rule, SYSTEM_APP};
 use crate::win::{self, wide, IPPROTO_ICMPV6, IPPROTO_UDP};
 
 const SUBLAYER_KEY: GUID = GUID::from_u128(0x7068_6f73_7769_7265_a1f0_3c5d_9e2b_4a61);
@@ -59,7 +59,7 @@ impl Layer {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Cond {
     Loopback,
     Protocol(u8),
@@ -72,7 +72,7 @@ pub enum Cond {
     UserSd(Vec<u8>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterSpec {
     pub name: String,
     pub layer: Layer,
@@ -115,6 +115,50 @@ pub fn app_id(path: &str) -> Result<Vec<u8>, String> {
         FwpmFreeMemory0(&mut blob as *mut _ as *mut *mut core::ffi::c_void);
         Ok(bytes)
     }
+}
+
+/// The application id for a rule already in the whitelist. Unlike `app_id`,
+/// a missing file is not an error: an update may have the file out of the
+/// way for a moment, and skipping the rule then would block the program
+/// until the next reload. The id is derived from the path instead, which is
+/// what WFP will report once the file is back.
+fn rule_app_id(path: &str) -> Result<Vec<u8>, String> {
+    app_id(path).or_else(|e| match win::dos_to_nt(path) {
+        Some(nt) => Ok(wide(&nt).iter().flat_map(|c| c.to_le_bytes()).collect()),
+        None => Err(e),
+    })
+}
+
+/// The application ids a rule stands for: one, or for a version pattern
+/// one per version installed. Problems worth knowing about go to `warnings`.
+fn rule_app_ids(rule: &Rule, warnings: &mut Vec<String>) -> Result<Vec<Vec<u8>>, String> {
+    if !config::is_pattern(&rule.path) {
+        return rule_app_id(&rule.path).map(|id| vec![id]);
+    }
+    // Checked on every reload, not only when the pattern was made, in case
+    // the folder's permissions have been loosened since.
+    if !win::pattern_protected(&rule.path) {
+        return Err(format!(
+            "`{}`: programs without administrator rights may add folders there, so trusting any version \
+             found in it is not safe; allow the program with --exact instead",
+            rule.path
+        ));
+    }
+    let (paths, more) = match config::expand_pattern(&rule.path) {
+        Ok(found) => found,
+        // Uninstalled: nothing to allow, nothing to warn about.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("`{}`: {e}", rule.path)),
+    };
+    if more {
+        warnings.push(format!(
+            "`{}` matches more than {} versions; only the {} highest are allowed",
+            rule.path,
+            config::MAX_VERSIONS,
+            config::MAX_VERSIONS
+        ));
+    }
+    paths.iter().map(|p| rule_app_id(p)).collect()
 }
 
 /// Translates the configuration into the full filter set. Rules that cannot
@@ -176,8 +220,10 @@ pub fn build_policy(cfg: &Config) -> (Vec<FilterSpec>, Vec<String>) {
     }
 
     for rule in &cfg.rules {
-        let mut conds = match app_id(&rule.path) {
-            Ok(app) => vec![Cond::App(app)],
+        // Several application ids in one filter are ORed.
+        let mut conds: Vec<Cond> = match rule_app_ids(rule, &mut warnings) {
+            Ok(ids) if ids.is_empty() => continue,
+            Ok(ids) => ids.into_iter().map(Cond::App).collect(),
             Err(e) => {
                 warnings.push(format!("rule skipped: {e}"));
                 continue;
@@ -306,6 +352,8 @@ pub struct Engine {
     allow_events_ours: bool,
     filter_ids: Vec<u64>,
     block_ids: HashSet<u64>,
+    /// What `filter_ids` were made from.
+    specs: Vec<FilterSpec>,
     /// Run-time layer ids, as reported in net events.
     layer_ids: Vec<(u16, Layer)>,
 }
@@ -350,6 +398,7 @@ impl Engine {
                 allow_events_ours: false,
                 filter_ids: Vec::new(),
                 block_ids: HashSet::new(),
+                specs: Vec::new(),
                 layer_ids: Vec::new(),
             };
 
@@ -410,6 +459,11 @@ impl Engine {
         self.block_ids.contains(&filter_id)
     }
 
+    /// True when the filters last applied were made from exactly `specs`.
+    pub fn is_current(&self, specs: &[FilterSpec]) -> bool {
+        self.specs == specs
+    }
+
     /// Atomically replaces every Phoswire filter with `specs`. On failure the
     /// previous filter set stays in force.
     pub fn apply(&mut self, specs: &[FilterSpec]) -> Result<(), String> {
@@ -443,6 +497,7 @@ impl Engine {
                     }
                     self.filter_ids = ids;
                     self.block_ids = blocks;
+                    self.specs = specs.to_vec();
                     Ok(())
                 }
                 Err(e) => {
@@ -610,7 +665,7 @@ mod tests {
     use crate::config::{Rule, Source};
 
     fn rule(path: &str, service: Option<&str>, inbound: bool) -> Rule {
-        Rule { path: path.into(), service: service.map(Into::into), inbound, source: Source::Manual, added: 0 }
+        Rule { path: path.into(), service: service.map(Into::into), inbound, source: Source::Manual, added: 0, exact: false }
     }
 
     fn svchost() -> String {
@@ -658,16 +713,66 @@ mod tests {
                 rule(&svchost(), None, true),
                 rule(r"C:\does\not\exist.exe", None, false),
                 rule(SYSTEM_APP, None, false),
+                rule(&svchost(), Some("NoSuchServicePhoswireTest"), false),
             ],
             ..Config::default()
         };
         let (specs, warnings) = build_policy(&cfg);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("NoSuchServicePhoswireTest"), "{warnings:?}");
         let apps: Vec<_> = specs.iter().filter(|s| s.weight == W_APP).collect();
-        // service rule: 2 outbound; inbound rule: 2 + 2; System: 2
-        assert_eq!(apps.len(), 8);
+        // service rule: 2 outbound; inbound rule: 2 + 2; missing file: 2; System: 2
+        assert_eq!(apps.len(), 10);
         assert_eq!(apps.iter().filter(|s| s.layer.is_inbound()).count(), 2);
         assert_eq!(apps.iter().filter(|s| s.conds.iter().any(|c| matches!(c, Cond::UserSd(_)))).count(), 2);
+    }
+
+    #[test]
+    fn a_missing_file_keeps_its_filter() {
+        // While an update has the file out of the way, the rule must still
+        // produce the very filter it will need once the file is back.
+        let missing = r"C:\Windows\System32\phoswire-no-such-file.exe";
+        assert!(app_id(missing).is_err());
+        let (specs, warnings) = build_policy(&Config { mode: Mode::Normal, rules: vec![rule(missing, None, false)], ..Config::default() });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let want = Cond::App(wide(&win::dos_to_nt(missing).unwrap()).iter().flat_map(|c| c.to_le_bytes()).collect());
+        assert_eq!(specs.iter().filter(|s| s.weight == W_APP && s.conds == [want.clone()]).count(), 2);
+        // Building twice gives the same filters, so a refresh changes nothing.
+        let (again, _) = build_policy(&Config { mode: Mode::Normal, rules: vec![rule(missing, None, false)], ..Config::default() });
+        assert_eq!(specs, again);
+    }
+
+    #[test]
+    fn version_patterns_cover_every_installed_version() {
+        let pattern = r"C:\ProgramData\Microsoft\Windows Defender\Platform\*\MsMpEng.exe";
+        let Ok((versions, _)) = config::expand_pattern(pattern) else {
+            eprintln!("no Defender platform folder here; skipped");
+            return;
+        };
+        assert!(win::pattern_protected(pattern));
+        assert!(win::path_protected(pattern));
+        let (specs, warnings) = build_policy(&Config { mode: Mode::Normal, rules: vec![rule(pattern, None, false)], ..Config::default() });
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let apps: Vec<_> = specs.iter().filter(|s| s.weight == W_APP).collect();
+        if versions.is_empty() {
+            assert!(apps.is_empty());
+            return;
+        }
+        assert_eq!(apps.len(), 2);
+        for spec in apps {
+            assert_eq!(spec.conds.iter().filter(|c| matches!(c, Cond::App(_))).count(), versions.len());
+        }
+    }
+
+    #[test]
+    fn version_patterns_where_users_can_add_folders_are_refused() {
+        let user_dir = std::env::temp_dir();
+        let pattern = format!(r"{}\*\app.exe", user_dir.display());
+        assert!(!win::pattern_protected(&pattern));
+        assert!(!win::pattern_protected(&format!(r"{}\*\app.exe", win::program_data())));
+        let (specs, warnings) = build_policy(&Config { mode: Mode::Normal, rules: vec![rule(&pattern, None, false)], ..Config::default() });
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(specs.iter().all(|s| s.weight != W_APP));
     }
 
     #[test]
