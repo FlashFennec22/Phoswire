@@ -129,18 +129,55 @@ pub fn is_svchost(path: &str) -> bool {
     path.eq_ignore_ascii_case(&system_svchost())
 }
 
-/// True when `path` is under Program Files or Windows, where ordinary users
-/// cannot write by default.
-fn in_protected_dir(path: &str) -> bool {
-    static DIRS: OnceLock<Vec<String>> = OnceLock::new();
+/// The system folder `path` is in or is, if any: Program Files or Windows,
+/// where ordinary users cannot create anything by default, or ProgramData,
+/// where they can create folders of their own. Returns the folder's length
+/// and whether it is ProgramData.
+fn protected_root(path: &str) -> Option<(usize, bool)> {
+    static DIRS: OnceLock<Vec<(String, bool)>> = OnceLock::new();
     let dirs = DIRS.get_or_init(|| {
         let mut dirs = vec![program_files().to_string(), windows_dir().to_string()];
         dirs.extend(known_folder(&FOLDERID_ProgramFilesX86));
         dirs.extend(known_folder(&FOLDERID_ProgramFilesX64));
-        dirs.iter().map(|d| d.to_ascii_lowercase()).collect()
+        let mut dirs: Vec<_> = dirs.iter().map(|d| (d.to_ascii_lowercase(), false)).collect();
+        dirs.push((program_data().to_ascii_lowercase(), true));
+        dirs
     });
     let lower = path.to_ascii_lowercase();
-    dirs.iter().any(|dir| lower.strip_prefix(dir.as_str()).is_some_and(|rest| rest.starts_with('\\')))
+    dirs.iter().find_map(|(dir, data)| {
+        let rest = lower.strip_prefix(dir.as_str())?;
+        (rest.is_empty() || rest.starts_with('\\')).then_some((dir.len(), *data))
+    })
+}
+
+/// True when no program without administrator rights can add, replace or
+/// rename anything in folder `dir`, nor in the folders between it and the
+/// Program Files, Windows or ProgramData folder it is in.
+///
+/// A folder that is missing or cannot be examined is judged by where it is:
+/// under ProgramData anyone may create it, elsewhere only administrators.
+pub fn dir_tree_protected(dir: &str) -> bool {
+    let Some((root_len, data)) = protected_root(dir) else { return false };
+    let mut d = Path::new(dir.trim_end_matches('\\'));
+    if data && d.as_os_str().len() <= root_len {
+        return false; // ProgramData itself: anyone may add folders
+    }
+    while d.as_os_str().len() > root_len {
+        match open_to_unprivileged(d) {
+            Some(true) => return false,
+            None if data => return false,
+            _ => {}
+        }
+        let Some(parent) = d.parent() else { break };
+        d = parent;
+    }
+    true
+}
+
+/// True when only administrators can create the folders a version pattern
+/// would trust, i.e. when the pattern cannot be used to slip in a program.
+pub fn pattern_protected(pattern: &str) -> bool {
+    crate::config::split_pattern(pattern).is_some_and(|(dir, _, _)| dir_tree_protected(dir))
 }
 
 /// True when a program without administrator rights cannot put a different
@@ -148,18 +185,19 @@ fn in_protected_dir(path: &str) -> bool {
 ///
 /// Being under Program Files or Windows is not enough: both contain folders
 /// any user can write to (`C:\Windows\Temp`, badly installed applications),
-/// so the permissions of the file and of its folder are checked as well.
+/// so the permissions of the file and of the folders above it are checked as
+/// well. For a version pattern, what matters is who may create versions.
 pub fn path_protected(path: &str) -> bool {
     if path.eq_ignore_ascii_case(crate::config::SYSTEM_APP) {
         return true;
     }
-    if !in_protected_dir(path) {
-        return false;
+    if crate::config::is_pattern(path) {
+        return pattern_protected(path);
     }
-    // A file that is missing or cannot be examined is judged by where it is.
-    let open = |p: &Path| open_to_unprivileged(p).unwrap_or(false);
     let file = Path::new(path);
-    !(open(file) || file.parent().is_some_and(open))
+    // A file that is missing or cannot be examined is judged by its folder.
+    !open_to_unprivileged(file).unwrap_or(false)
+        && file.parent().is_some_and(|dir| dir_tree_protected(&dir.to_string_lossy()))
 }
 
 // ---------------------------------------------------------------------------
