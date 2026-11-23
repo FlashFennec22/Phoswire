@@ -39,6 +39,19 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const EXPIRE_RETRY: Duration = Duration::from_secs(30);
 /// How often the installed filters are checked against the engine.
 const FILTER_CHECK: Duration = Duration::from_secs(30);
+/// How often the whitelist is resolved against the disk again, so that new
+/// versions of a program and rules that could not be resolved before (a
+/// drive not yet mounted at boot) get their filters.
+const RULE_REFRESH: Duration = Duration::from_secs(60);
+/// The soonest the whitelist is resolved again after a whitelisted program
+/// was blocked anyway.
+const REFRESH_MIN: Duration = Duration::from_secs(10);
+
+/// The version pattern to trust in place of `path`, if `path` is in a
+/// versioned folder and only administrators can add versions next to it.
+fn versioned(path: &str) -> Option<String> {
+    config::version_pattern(path).filter(|p| win::pattern_protected(p))
+}
 
 /// Set once the data directory has been verified; until then nothing is
 /// written there, because it may be under an unprivileged user's control.
@@ -90,6 +103,15 @@ pub struct Core {
     filters_checked: Instant,
     /// The last attempt to reinstall missing filters failed (logged once).
     repair_failed: bool,
+    /// When the filters were last built from the whitelist.
+    refreshed: Instant,
+    /// A whitelisted program was blocked; resolve the whitelist again soon.
+    refresh_due: bool,
+    /// The last refresh failed to install its filters (logged once).
+    refresh_failed: bool,
+    /// The filters have been removed for good; housekeeping must not put
+    /// them back.
+    stopped: bool,
 }
 
 impl Core {
@@ -131,6 +153,17 @@ impl Core {
         if cfg.mode == Mode::Learning && cfg.learning_since.is_none() {
             cfg.learning_since = Some(config::now());
         }
+        // Rules from before version patterns existed, or made for a single
+        // version with a pattern now possible, follow the program from now on.
+        let generalized = cfg.generalize(versioned);
+        for (old, new) in &generalized {
+            log(&format!("{old} now covers every version: {new}"));
+        }
+        if !generalized.is_empty() && storage_problem.is_none() {
+            if let Err(e) = cfg.save() {
+                log(&format!("saving the config failed: {e}"));
+            }
+        }
         let mut engine = Engine::open()?;
         if storage_problem.is_none() && allow_events_marker().exists() {
             // A previous run turned on the reporting of allowed connections
@@ -157,6 +190,10 @@ impl Core {
             expire_retry: None,
             filters_checked: Instant::now(),
             repair_failed: false,
+            refreshed: Instant::now(),
+            refresh_due: false,
+            refresh_failed: false,
+            stopped: false,
         };
         core.reapply()?;
         log(&format!(
@@ -171,7 +208,12 @@ impl Core {
     /// Pushes the current configuration into WFP.
     fn reapply(&mut self) -> Result<(), String> {
         let (specs, warnings) = wfp::build_policy(&self.cfg);
-        self.engine.apply(&specs)?;
+        self.install(&specs, warnings)
+    }
+
+    fn install(&mut self, specs: &[wfp::FilterSpec], warnings: Vec<String>) -> Result<(), String> {
+        self.engine.apply(specs)?;
+        self.refreshed = Instant::now();
         self.warnings = warnings;
         if let Err(e) = self.engine.set_allow_events(self.cfg.mode == Mode::Learning) {
             self.warnings.push(e);
@@ -214,6 +256,7 @@ impl Core {
     }
 
     pub fn shutdown(&mut self) {
+        self.stopped = true;
         let _ = self.engine.apply(&[]);
         let _ = self.engine.set_allow_events(false);
         self.record_allow_events();
@@ -311,28 +354,44 @@ impl Core {
                     None => format!("mode: {mode}"),
                 })
             }
-            Request::Allow { path, service, inbound, outbound_only } => {
+            Request::Allow { path, service, inbound, outbound_only, exact } => {
                 // Validate up front so a typo is an error, not a silent no-op.
                 wfp::app_id(&path)?;
                 if let Some(s) = &service {
                     win::service_sd(s)?;
                 }
+                let target = match exact {
+                    true => path.clone(),
+                    false => versioned(&path).unwrap_or_else(|| path.clone()),
+                };
                 let mut new = self.cfg.clone();
-                let added = new.add(path.clone(), service.clone(), inbound, Source::Manual);
+                let added = new.add(target.clone(), service.clone(), inbound, Source::Manual);
+                if exact {
+                    if let Some(i) = new.find(&target, service.as_deref()) {
+                        new.rules[i].exact = true;
+                    }
+                } else {
+                    // Fold rules for other single versions into the pattern.
+                    new.generalize(versioned);
+                }
                 if outbound_only {
-                    if let Some(i) = new.find(&path, service.as_deref()) {
+                    if let Some(i) = new.find(&target, service.as_deref()) {
                         new.rules[i].inbound = false;
                     }
                 }
                 self.commit(new)?;
-                self.blocked.retain(|_, b| !config::eq_ignore_case(&b.path, &path));
-                log(&format!("allowed {path} (service {service:?}, inbound {inbound})"));
-                done(if added { format!("allowed: {path}") } else { format!("already allowed: {path}") })
+                self.blocked.retain(|_, b| !config::path_matches(&target, &b.path));
+                log(&format!("allowed {target} (service {service:?}, inbound {inbound})"));
+                let what = match config::is_pattern(&target) {
+                    true => format!("{target}\n(any version of it; `allow --exact` allows only the one given)"),
+                    false => target,
+                };
+                done(if added { format!("allowed: {what}") } else { format!("already allowed: {what}") })
             }
             Request::Remove { path, service } => {
                 let index = self
                     .cfg
-                    .find(&path, service.as_deref())
+                    .find_matching(&path, service.as_deref())
                     .ok_or_else(|| format!("no rule for {path}"))?;
                 self.remove_at(index)
             }
@@ -473,8 +532,43 @@ impl Core {
 
     /// Housekeeping, called a few times a second.
     pub fn tick(&mut self) {
+        if self.stopped {
+            return;
+        }
         self.check_filters();
+        self.refresh_rules();
         self.poll_sockets();
+    }
+
+    /// Builds the filters from the whitelist again and installs them if the
+    /// result differs from what is in place: a program under a version
+    /// pattern was updated, or a rule that could not be resolved last time
+    /// now can be. Runs every `RULE_REFRESH`, and after a whitelisted
+    /// program was blocked, as soon as `REFRESH_MIN` allows.
+    fn refresh_rules(&mut self) {
+        let since = self.refreshed.elapsed();
+        if since < RULE_REFRESH && !(self.refresh_due && since >= REFRESH_MIN) {
+            return;
+        }
+        self.refreshed = Instant::now();
+        self.refresh_due = false;
+        let (specs, warnings) = wfp::build_policy(&self.cfg);
+        if self.engine.is_current(&specs) {
+            self.refresh_failed = false;
+            return;
+        }
+        match self.install(&specs, warnings) {
+            Ok(()) => {
+                log("whitelisted programs changed on disk; filters updated");
+                self.refresh_failed = false;
+            }
+            Err(e) => {
+                if !self.refresh_failed {
+                    log(&format!("whitelisted programs changed on disk, but updating the filters failed: {e}"));
+                }
+                self.refresh_failed = true;
+            }
+        }
     }
 
     /// Reinstalls the filters if something else removed any of them from the
@@ -553,8 +647,11 @@ impl Core {
         if services.is_empty() {
             // svchost.exe hosts most of Windows; trusting the whole binary
             // would defeat zero trust, so it is only ever learned per service.
-            if !win::is_svchost(&path) && new.add(path.clone(), None, false, Source::Learned) {
-                added.push(path);
+            if !win::is_svchost(&path) {
+                let target = versioned(&path).unwrap_or(path);
+                if new.add(target.clone(), None, false, Source::Learned) {
+                    added.push(target);
+                }
             }
         } else {
             for service in services {
@@ -579,12 +676,19 @@ impl Core {
     }
 
     fn record_block(&mut self, ev: &NetEvent, path: String, inbound: bool) {
+        let services = if win::is_svchost(&path) { self.services_for(ev) } else { Vec::new() };
+        // A whitelisted program blocked anyway: its file was most likely
+        // replaced by a new version, or missing when the filters were made.
+        let whitelisted = match services.is_empty() {
+            true => self.cfg.covers(&path, None),
+            false => services.iter().any(|s| self.cfg.covers(&path, Some(s))),
+        };
+        if whitelisted && !inbound {
+            self.refresh_due = true;
+        }
         let mut subject = path;
-        if win::is_svchost(&subject) {
-            let services = self.services_for(ev);
-            if !services.is_empty() {
-                subject = format!("{subject} [service: {}]", services.join(", "));
-            }
+        if !services.is_empty() {
+            subject = format!("{subject} [service: {}]", services.join(", "));
         }
         let remote = match ev.remote {
             Some(addr) => format!("{addr}:{}", ev.remote_port),

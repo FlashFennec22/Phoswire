@@ -54,6 +54,10 @@ enum Command {
         /// Withdraw inbound access from a rule that has it
         #[arg(long, conflicts_with = "inbound")]
         outbound_only: bool,
+        /// For a program in a versioned folder (`...\4.18.26080.4-0\app.exe`),
+        /// allow only this version instead of every version
+        #[arg(long)]
+        exact: bool,
     },
     /// Remove a rule by path or by its number from `list` (for a file whose
     /// name is a number, write it as a path: `.\3`)
@@ -104,8 +108,8 @@ fn run(command: Command) -> Result<(), String> {
         }
         Command::Status => Request::Status,
         Command::Mode { mode, hours } => Request::SetMode { mode, hours },
-        Command::Allow { path, service, inbound, outbound_only } => {
-            Request::Allow { path: resolve_path(&path)?, service, inbound, outbound_only }
+        Command::Allow { path, service, inbound, outbound_only, exact } => {
+            Request::Allow { path: resolve_path(&path)?, service, inbound, outbound_only, exact }
         }
         Command::Remove { target, service } => match target.parse::<usize>() {
             Ok(index) if service.is_none() => Request::RemoveIndex { index },
@@ -211,6 +215,11 @@ fn print_reply(reply: Reply) -> Result<(), String> {
                 if r.inbound {
                     tags.push("inbound".into());
                 }
+                if config::is_pattern(&r.path) {
+                    tags.push("any version".into());
+                } else if r.exact {
+                    tags.push("this version only".into());
+                }
                 if !win::path_protected(&r.path) {
                     tags.push("unprotected path".into());
                     unprotected = true;
@@ -222,6 +231,11 @@ fn print_reply(reply: Reply) -> Result<(), String> {
                 println!("Rules trust a path, not a file. \"unprotected path\" marks a rule whose file a program without");
                 println!("administrator rights could replace: one outside Program Files and Windows, or in a folder");
                 println!("there that ordinary users are allowed to write to.");
+            }
+            if rules.iter().any(|r| config::is_pattern(&r.path)) {
+                println!();
+                println!("A `*` in a rule stands for a version number: the rule follows a program that installs each");
+                println!("update into a new folder. Only folders that just administrators can add to qualify.");
             }
         }
         Reply::Blocked { entries } => {
