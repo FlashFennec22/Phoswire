@@ -1,17 +1,13 @@
 ﻿//! Phoswire: a light zero-trust application firewall for Windows.
 
-mod config;
-mod ipc;
-mod service;
-mod wfp;
-mod win;
-
+use std::net::SocketAddr;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use config::{Mode, Source, SYSTEM_APP};
-use ipc::{Reply, Request};
+use phoswire::config::{self, Mode, Source, SYSTEM_APP};
+use phoswire::ipc::{self, Reply, Request};
+use phoswire::{service, win};
 
 #[derive(Parser)]
 #[command(name = "phoswire", version, about = "Zero-trust application firewall that works alongside Windows Firewall")]
@@ -74,6 +70,8 @@ enum Command {
         #[arg(long)]
         clear: bool,
     },
+    /// Show the open TCP connections of whitelisted apps
+    Connections,
     /// Run the firewall in this console instead of as a service (elevated; for testing)
     Run,
     /// Service entry point, used by the service control manager
@@ -116,6 +114,7 @@ fn run(command: Command) -> Result<(), String> {
         Command::List => Request::List,
         Command::Blocked { clear: true } => Request::ClearBlocked,
         Command::Blocked { clear: false } => Request::Blocked,
+        Command::Connections => Request::Connections,
     };
     print_reply(ipc::request(&request)?)
 }
@@ -239,6 +238,28 @@ fn print_reply(reply: Reply) -> Result<(), String> {
                     b.count,
                     age(b.last)
                 );
+            }
+        }
+        Reply::Connections { apps, .. } => {
+            let (active, idle): (Vec<_>, Vec<_>) = apps.iter().partition(|a| !a.connections.is_empty());
+            if active.is_empty() {
+                println!("No whitelisted app has an open connection.");
+            }
+            for app in &active {
+                let n = app.connections.len();
+                println!("{}  ({n} connection{})", app.rule.subject(), if n == 1 { "" } else { "s" });
+                for c in &app.connections {
+                    println!(
+                        "    {} {:<46} {:<12} pid {}",
+                        if c.inbound { "<-" } else { "->" },
+                        SocketAddr::new(c.remote, c.remote_port),
+                        c.state,
+                        c.pid
+                    );
+                }
+            }
+            if !idle.is_empty() {
+                println!("{} other whitelisted app(s) have no open connections.", idle.len());
             }
         }
     }

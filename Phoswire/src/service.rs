@@ -19,6 +19,7 @@ use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::config::{self, Config, Mode, Source};
+use crate::conns;
 use crate::ipc::{self, Blocked, Counters, Reply, Request, Status};
 use crate::wfp::{self, Engine, NetEvent};
 use crate::win;
@@ -351,6 +352,10 @@ impl Core {
                 self.blocked.clear();
                 done("blocked list cleared".into())
             }
+            // Normally answered by `answer` without the lock; kept for completeness.
+            Request::Connections => {
+                Ok(Reply::Connections { mode: self.cfg.mode, apps: conns::collect(&self.cfg.rules) })
+            }
         }
     }
 
@@ -606,6 +611,22 @@ impl Core {
     }
 }
 
+/// Answers a request from either pipe. Listing connections opens every
+/// process that has one, which is slow next to everything else, so it is
+/// done on a copy of the rules rather than while holding up net events.
+fn answer(core: &Mutex<Core>, req: Request) -> Reply {
+    match req {
+        Request::Connections => {
+            let (mode, rules) = {
+                let core = core.lock().unwrap();
+                (core.cfg.mode, core.cfg.rules.clone())
+            };
+            Reply::Connections { mode, apps: conns::collect(&rules) }
+        }
+        req => core.lock().unwrap().handle(req),
+    }
+}
+
 /// Runs the firewall until `stop` fires (or forever if its sender is kept
 /// alive). `ready` is called once the filters are in place.
 pub fn run(stop: Receiver<()>, ready: impl FnOnce()) -> Result<(), String> {
@@ -626,9 +647,24 @@ pub fn run(stop: Receiver<()>, ready: impl FnOnce()) -> Result<(), String> {
         // ours again the moment that program exits.
         let mut reported = false;
         loop {
-            if let Err(e) = ipc::serve(|req| c.lock().unwrap().handle(req)) {
+            if let Err(e) = ipc::serve(|req| answer(&c, req)) {
                 if !reported {
                     log(&format!("control pipe unavailable ({e}); the firewall keeps running, retrying"));
+                    reported = true;
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+    let c = core.clone();
+    std::thread::spawn(move || {
+        // The read-only pipe for the tray window, on a thread of its own so
+        // that a viewer can never hold up the control pipe.
+        let mut reported = false;
+        loop {
+            if let Err(e) = ipc::serve_view(|req| answer(&c, req)) {
+                if !reported {
+                    log(&format!("viewer pipe unavailable ({e}); the firewall keeps running, retrying"));
                     reported = true;
                 }
             }
