@@ -21,7 +21,17 @@ Phoswire barely exists from a system resources perspective, taking up just over 
 
 ## Is this a graphical application?
 
-Strictly command line at this time. I would prefer to keep the service as slim and trim as possible.
+The firewall is controlled from the command line. I would prefer to keep the service as slim and trim as possible.
+
+There is an optional, read-only window for watching it: `phoswire-tray.exe` puts a shield icon in the notification area. Clicking the icon opens a list of whitelisted apps; clicking an app opens it to show the addresses it is connected to right now, with host names, ports, state, direction and process ID. It refreshes every two seconds while open.
+
+- `phoswire-tray` opens the window, or brings up the one already running.
+- `phoswire-tray --hidden` starts with just the icon. The installer can do this at sign-in.
+- Closing the window keeps the icon. To quit, right-click the icon and choose *Exit tray icon*.
+
+The tray runs without administrator rights and cannot change anything. It reads from the service through a second pipe that refuses every request that would change the firewall. `phoswire connections` prints the same list in an elevated terminal.
+
+Host names come from the Windows DNS cache where possible, so they show the name an app looked up (`www.youtube.com`) rather than the provider's internal name a reverse lookup returns. Apps that resolve names themselves, as some browsers with secure DNS do, only get reverse-lookup names, or none. Only TCP connections are listed; UDP has no connections to show.
 
 ## How do I use it?
 
@@ -42,6 +52,7 @@ Things worth knowing before relying on it:
 - **Learning mode trusts all outbound connections and permanently whitelists programs making them**, including anything unwanted that is already running. Use it briefly, on a machine you believe is clean: `phoswire mode learning --hours 8` switches back to normal by itself. Learning switched on by the installer ends after 24 hours; from then on anything not yet whitelisted is blocked, and `phoswire blocked` shows what to allow.
 - **Local connections are always allowed.** A program that is not whitelisted can still talk to a whitelisted one on the same machine, so a whitelisted local proxy or VPN client lets everything through.
 - **Name lookups are always allowed** through the Windows DNS Client, for every program. Data can be smuggled out inside DNS queries.
+- **Anyone signed in at the computer can read the whitelist and the connections of whitelisted apps** through the tray's read-only pipe. That includes other users of the same machine. They cannot change anything through it.
 - **Virtual machines and WSL 2 are probably not covered.** Their traffic does not pass through the part of Windows that Phoswire filters. This has not been tested.
 
 ## Files

@@ -2,6 +2,7 @@
 //! local port back to the process and services that own it.
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr::{null, null_mut};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -384,7 +385,7 @@ pub fn path_owner_trusted(path: &Path) -> bool {
 
 /// Same check for an open kernel object such as a named pipe. `Err` carries
 /// the Win32 error when the owner could not be read at all.
-pub fn handle_owner_trusted(handle: HANDLE) -> Result<bool, u32> {
+pub(crate) fn handle_owner_trusted(handle: HANDLE) -> Result<bool, u32> {
     let mut owner: PSID = null_mut();
     let mut sd = null_mut();
     let rc = unsafe {
@@ -578,6 +579,53 @@ pub fn network_pids() -> HashSet<u32> {
     }
     pids.remove(&0);
     pids
+}
+
+/// One row of the system's TCP table.
+#[derive(Debug, Clone)]
+pub struct TcpRow {
+    pub pid: u32,
+    pub local: IpAddr,
+    pub local_port: u16,
+    pub remote: IpAddr,
+    pub remote_port: u16,
+    /// `MIB_TCP_STATE`: 2 is listening, 5 established, 11 time-wait, ...
+    pub state: u32,
+}
+
+/// Every TCP socket on the machine, IPv4 and IPv6, with its owning process.
+pub fn tcp_table() -> Vec<TcpRow> {
+    let mut out = Vec::new();
+    unsafe {
+        if let Some(buf) = fetch_table(|p, s| GetExtendedTcpTable(p, s, 0, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0)) {
+            let t = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+            let rows: &[MIB_TCPROW_OWNER_PID] =
+                std::slice::from_raw_parts((*t).table.as_ptr(), (*t).dwNumEntries as usize);
+            // Addresses are stored in network byte order.
+            out.extend(rows.iter().map(|r| TcpRow {
+                pid: r.dwOwningPid,
+                local: Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes()).into(),
+                local_port: net_port(r.dwLocalPort),
+                remote: Ipv4Addr::from(r.dwRemoteAddr.to_ne_bytes()).into(),
+                remote_port: net_port(r.dwRemotePort),
+                state: r.dwState,
+            }));
+        }
+        if let Some(buf) = fetch_table(|p, s| GetExtendedTcpTable(p, s, 0, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0)) {
+            let t = buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
+            let rows: &[MIB_TCP6ROW_OWNER_PID] =
+                std::slice::from_raw_parts((*t).table.as_ptr(), (*t).dwNumEntries as usize);
+            out.extend(rows.iter().map(|r| TcpRow {
+                pid: r.dwOwningPid,
+                local: Ipv6Addr::from(r.ucLocalAddr).into(),
+                local_port: net_port(r.dwLocalPort),
+                remote: Ipv6Addr::from(r.ucRemoteAddr).into(),
+                remote_port: net_port(r.dwRemotePort),
+                state: r.dwState,
+            }));
+        }
+    }
+    out
 }
 
 /// Full image path of a process; `System` for the kernel.

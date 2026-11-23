@@ -10,6 +10,7 @@
 #define AppName "Phoswire"
 #define AppVersion "0.3.0"
 #define AppExe "phoswire.exe"
+#define TrayExe "phoswire-tray.exe"
 ; Learning switched on by setup ends by itself, so a forgotten install does
 ; not leave outbound traffic open for good.
 #define LearningHours "24"
@@ -38,14 +39,26 @@ CloseApplications=no
 [Tasks]
 Name: "learning"; Description: "Start in &learning mode for {#LearningHours} hours (recommended; otherwise every app is blocked until you whitelist it)"; Check: IsFreshInstall
 Name: "path"; Description: "Add Phoswire to the system &PATH so `phoswire` works from any terminal"
+Name: "tray"; Description: "Show the Phoswire &tray icon when signing in (lists the connections of whitelisted apps)"
 
 [Files]
 Source: "..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\{#TrayExe}"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autoprograms}\Phoswire Connections"; Filename: "{app}\{#TrayExe}"
+Name: "{commonstartup}\Phoswire Tray"; Filename: "{app}\{#TrayExe}"; Parameters: "--hidden"; Tasks: tray
+
+[Run]
+; As the signed-in user, not as the elevated installer.
+Filename: "{app}\{#TrayExe}"; Parameters: "--hidden"; Flags: nowait runasoriginaluser; Tasks: tray
 
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: path; Check: NeedsAddPath(ExpandConstant('{app}'))
 
 [UninstallRun]
+; The tray holds its exe open in every session where it runs.
+Filename: "{sys}\taskkill.exe"; Parameters: "/f /im {#TrayExe}"; Flags: runhidden; RunOnceId: "StopPhoswireTray"
 Filename: "{app}\{#AppExe}"; Parameters: "uninstall"; Flags: runhidden; RunOnceId: "RemovePhoswireService"
 
 [Code]
@@ -91,7 +104,8 @@ begin
   RegWriteExpandStringValue(HKLM, EnvKey, 'Path', Paths);
 end;
 
-{ On an upgrade the running service holds phoswire.exe open; stop it first.
+{ On an upgrade the running service holds phoswire.exe open, and the tray
+  holds phoswire-tray.exe; stop both first.
   `phoswire stop` returns once the service has actually stopped. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
@@ -102,6 +116,7 @@ begin
   Exe := ExpandConstant('{app}\{#AppExe}');
   if FileExists(Exe) then
     Exec(Exe, 'stop', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#TrayExe}', '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
 { Registers and starts the service once the files are in place.
