@@ -8,7 +8,7 @@
 ; the service at %ProgramFiles%\Phoswire\phoswire.exe.
 
 #define AppName "Phoswire"
-#define AppVersion "0.4.0"
+#define AppVersion "0.5.0"
 #define AppExe "phoswire.exe"
 #define TrayExe "phoswire-tray.exe"
 ; Learning switched on by setup ends by itself, so a forgotten install does

@@ -10,18 +10,29 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::net::IpAddr;
+use std::ptr::null;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use phoswire::config::Rule;
 use phoswire::conns::AppConnections;
 use phoswire::win::wide;
+use windows_sys::core::w;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, PtInRect};
+use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    SendMessageW, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_SETREDRAW,
+    SendMessageW, WM_GETFONT, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_NOTIFY,
+    WM_SETREDRAW,
 };
+
+use crate::theme::{self, Theme};
+
+/// Whether the list is dark, where the column titles and app headings are
+/// painted here (the list view has only one window).
+static DARK: AtomicBool = AtomicBool::new(false);
 
 /// (title, width at 96 dpi, right-aligned)
 const COLUMNS: [(&str, i32, bool); 6] = [
@@ -88,7 +99,6 @@ impl View {
     pub fn new(hwnd: HWND, dpi: u32) -> View {
         let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER;
         send(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, ex as WPARAM, ex as LPARAM);
-        unsafe { SetWindowTheme(hwnd, windows_sys::core::w!("Explorer"), std::ptr::null()) };
         for (i, (title, _, right)) in COLUMNS.iter().enumerate() {
             let mut text = wide(title);
             let mut col: LVCOLUMNW = unsafe { zeroed() };
@@ -111,6 +121,28 @@ impl View {
         };
         view.set_dpi(dpi);
         view
+    }
+
+    /// Colours the list, its column headers and scroll bars for `theme`.
+    pub fn set_theme(&self, theme: &Theme) {
+        let header = send(self.hwnd, LVM_GETHEADER, 0, 0) as HWND;
+        let (list_style, header_style) = match theme.control_style() {
+            Some(dark) => (dark, w!("DarkMode_ItemsView")),
+            None => (w!("Explorer"), null()),
+        };
+        unsafe {
+            SetWindowTheme(self.hwnd, list_style, null());
+            SetWindowTheme(header, header_style, null());
+        }
+        send(self.hwnd, LVM_SETBKCOLOR, 0, theme.background as LPARAM);
+        send(self.hwnd, LVM_SETTEXTBKCOLOR, 0, theme.background as LPARAM);
+        send(self.hwnd, LVM_SETTEXTCOLOR, 0, theme.text as LPARAM);
+        // See `list_subclass` and `custom_draw`.
+        DARK.store(theme.dark, Ordering::Relaxed);
+        unsafe {
+            InvalidateRect(header, null(), 1);
+            InvalidateRect(self.hwnd, null(), 1);
+        }
     }
 
     pub fn set_dpi(&self, dpi: u32) {
@@ -266,6 +298,87 @@ impl View {
     }
 }
 
+/// Answers the list view's `NM_CUSTOMDRAW` (sent to the window).
+pub fn custom_draw(cd: &NMLVCUSTOMDRAW) -> LRESULT {
+    if !DARK.load(Ordering::Relaxed) || cd.nmcd.dwDrawStage != CDDS_PREPAINT {
+        return CDRF_DODEFAULT as LRESULT;
+    }
+    if cd.dwItemType == LVCDI_GROUP {
+        // The dark list style writes app names in dark blue and paths in dark
+        // grey, and ignores any colour asked for: the heading is drawn here.
+        draw_group_header(cd);
+        return CDRF_SKIPDEFAULT as LRESULT;
+    }
+    CDRF_DODEFAULT as LRESULT
+}
+
+/// One app's heading in the dark theme, laid out like the light one: the
+/// name over the path, and an arrow at the far end showing whether the app
+/// is open.
+fn draw_group_header(cd: &NMLVCUSTOMDRAW) {
+    let lv = cd.nmcd.hdr.hwndFrom;
+    let hdc = cd.nmcd.hdc;
+    let id = cd.nmcd.dwItemSpec;
+    let area = cd.rcText;
+    let dpi = unsafe { GetDpiForWindow(lv) }.max(96) as i32;
+    let s = |v: i32| v * dpi / 96;
+
+    let mut header = [0u16; 512];
+    let mut subtitle = [0u16; 1024];
+    let mut g: LVGROUP = unsafe { zeroed() };
+    g.cbSize = size_of::<LVGROUP>() as u32;
+    g.mask = LVGF_HEADER | LVGF_SUBTITLE;
+    g.pszHeader = header.as_mut_ptr();
+    g.cchHeader = header.len() as i32;
+    g.pszSubtitle = subtitle.as_mut_ptr();
+    g.cchSubtitle = subtitle.len() as u32;
+    send(lv, LVM_GETGROUPINFO, id, &mut g as *mut _ as LPARAM);
+    let collapsed = send(lv, LVM_GETGROUPSTATE, id, LVGS_COLLAPSED as LPARAM) as u32 & LVGS_COLLAPSED != 0;
+
+    unsafe {
+        let hot = cd.nmcd.uItemState & CDIS_HOT != 0;
+        let fill = CreateSolidBrush(if hot { theme::DARK_HOT } else { theme::DARK_BACKGROUND });
+        FillRect(hdc, &area, fill);
+        DeleteObject(fill as HGDIOBJ);
+
+        let font = send(lv, WM_GETFONT, 0, 0) as HGDIOBJ;
+        let old_font = SelectObject(hdc, font);
+        let mut tm: TEXTMETRICW = zeroed();
+        GetTextMetricsW(hdc, &mut tm);
+        let line = tm.tmHeight;
+        let arrow_space = s(28);
+        let top = area.top + (area.bottom - area.top - 2 * line) / 2;
+        let left = area.left + s(7);
+        let right = (area.right - arrow_space).max(left);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        let format = DT_SINGLELINE | DT_LEFT | DT_TOP | DT_NOPREFIX | DT_END_ELLIPSIS;
+        SetTextColor(hdc, theme::DARK_TEXT);
+        let mut rc = RECT { left, top, right, bottom: top + line };
+        DrawTextW(hdc, header.as_ptr(), -1, &mut rc, format);
+        SetTextColor(hdc, theme::DARK_SECONDARY_TEXT);
+        let mut rc = RECT { left, top: top + line, right, bottom: top + 2 * line };
+        DrawTextW(hdc, subtitle.as_ptr(), -1, &mut rc, format | DT_PATH_ELLIPSIS);
+        SelectObject(hdc, old_font);
+
+        // The arrow: pointing right while closed, down while open.
+        let (cx, cy, arm) = (area.right - arrow_space / 2, (area.top + area.bottom) / 2, s(4));
+        let points = if collapsed {
+            [POINT { x: cx - arm / 2, y: cy - arm }, POINT { x: cx + arm / 2, y: cy }, POINT { x: cx - arm / 2, y: cy + arm + 1 }]
+        } else {
+            [POINT { x: cx - arm, y: cy - arm / 2 }, POINT { x: cx, y: cy + arm / 2 }, POINT { x: cx + arm + 1, y: cy - arm / 2 - 1 }]
+        };
+        let pen = CreatePen(PS_SOLID, s(1), theme::DARK_SECONDARY_TEXT);
+        let old_pen = SelectObject(hdc, pen as HGDIOBJ);
+        Polyline(hdc, points.as_ptr(), points.len() as i32);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen as HGDIOBJ);
+
+        if cd.nmcd.uItemState & CDIS_FOCUS != 0 {
+            DrawFocusRect(hdc, &area);
+        }
+    }
+}
+
 fn set_collapsed(lv: HWND, id: i32, collapsed: bool) {
     let mut g: LVGROUP = unsafe { zeroed() };
     g.cbSize = size_of::<LVGROUP>() as u32;
@@ -304,6 +417,22 @@ unsafe extern "system" fn list_subclass(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    if msg == WM_NOTIFY {
+        // The column headers report to the list view, not the window.
+        let cd = &*(lp as *const NMCUSTOMDRAW);
+        if cd.hdr.code == NM_CUSTOMDRAW && DARK.load(Ordering::Relaxed) {
+            // The dark header style draws its titles in black.
+
+            match cd.dwDrawStage {
+                CDDS_PREPAINT => return CDRF_NOTIFYITEMDRAW as LRESULT,
+                CDDS_ITEMPREPAINT => {
+                    SetTextColor(cd.hdc, theme::DARK_TEXT);
+                    return CDRF_DODEFAULT as LRESULT;
+                }
+                _ => {}
+            }
+        }
+    }
     if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP) {
         let pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
         if let Some(id) = header_at(hwnd, pt) {

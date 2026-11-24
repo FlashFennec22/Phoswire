@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod names;
+mod theme;
 mod view;
 
 use std::cell::RefCell;
@@ -40,6 +41,7 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use names::{Lookup, Resolver};
+use theme::Theme;
 use view::View;
 
 const CLASS: windows_sys::core::PCWSTR = w!("PhoswireTrayWindow");
@@ -92,6 +94,7 @@ struct App {
     collapse: HWND,
     list: View,
     font: HFONT,
+    theme: Theme,
     dpi: u32,
     preview: bool,
     shared: Arc<Shared>,
@@ -217,6 +220,7 @@ fn main() {
             collapse,
             list: View::new(list_hwnd, dpi),
             font: null_mut(),
+            theme: Theme::current(),
             dpi,
             preview,
             shared: shared.clone(),
@@ -227,6 +231,7 @@ fn main() {
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| {
             a.apply_font();
+            a.apply_theme();
             a.layout();
             a.add_tray_icon();
         });
@@ -312,6 +317,19 @@ impl App {
                 DeleteObject(self.font as HGDIOBJ);
             }
             self.font = font;
+        }
+    }
+
+    /// Takes up the light or dark theme Windows asks for now.
+    fn apply_theme(&mut self) {
+        self.theme = Theme::current();
+        self.theme.apply_title_bar(self.hwnd);
+        for button in [self.expand, self.collapse, self.idle] {
+            self.theme.apply_button(button);
+        }
+        self.list.set_theme(&self.theme);
+        unsafe {
+            RedrawWindow(self.hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
     }
 
@@ -542,10 +560,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.on_dpi_changed(loword(wp) as u32, suggested));
             0
         }
-        WM_CTLCOLORSTATIC => {
-            // Match the window background behind the label and checkbox.
-            SetBkMode(wp as HDC, TRANSPARENT as i32);
-            GetSysColorBrush(COLOR_WINDOW) as LRESULT
+        WM_ERASEBKGND => {
+            let painted = with_app(|a| {
+                let mut rc: RECT = zeroed();
+                GetClientRect(hwnd, &mut rc);
+                FillRect(wp as HDC, &rc, a.theme.brush);
+            });
+            match painted {
+                Some(()) => 1,
+                None => DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            // Match the window background behind the label, the checkbox and
+            // the corners of the buttons.
+            let hdc = wp as HDC;
+            SetBkMode(hdc, TRANSPARENT as i32);
+            with_app(|a| {
+                SetTextColor(hdc, a.theme.text);
+                a.theme.brush as LRESULT
+            })
+            .unwrap_or_else(|| GetSysColorBrush(COLOR_WINDOW) as LRESULT)
+        }
+        WM_NOTIFY => {
+            let hdr = &*(lp as *const NMHDR);
+            if hdr.idFrom == ID_IDLE && hdr.code == NM_CUSTOMDRAW {
+                let cd = &*(lp as *const NMCUSTOMDRAW);
+                with_app(|a| theme::draw_checkbox(&a.theme, cd, a.font, a.dpi)).unwrap_or(CDRF_DODEFAULT as LRESULT)
+            } else if hdr.idFrom == ID_LIST && hdr.code == NM_CUSTOMDRAW {
+                let cd = &*(lp as *const NMLVCUSTOMDRAW);
+                view::custom_draw(cd)
+            } else {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+        }
+        WM_SETTINGCHANGE if theme::is_theme_setting(wp, lp) => {
+            with_app(|a| a.apply_theme());
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            with_app(|a| a.apply_theme());
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CLOSE => {
             // Closing the window leaves the tray icon; Exit is in its menu.
