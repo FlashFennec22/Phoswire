@@ -1,6 +1,6 @@
 [package]
 name = "phoswire"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "A light zero-trust application firewall for Windows, layered on the Windows Filtering Platform"
 license = "MIT"
@@ -35,6 +35,7 @@ features = [
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

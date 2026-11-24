@@ -734,3 +734,43 @@ pub fn services_by_pid() -> HashMap<u32, Vec<String>> {
     }
     out
 }
+
+/// True when this process runs with administrator rights: elevated through
+/// UAC, or as an administrator with UAC switched off. Only such a process can
+/// open the control pipe.
+pub fn is_elevated() -> bool {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut _,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Makes a path absolute relative to the caller's directory, since the
+/// service has a different working directory, and drops the `\?\` prefix
+/// that canonicalising adds.
+pub fn resolve_path(path: &str) -> Result<String, String> {
+    if path.eq_ignore_ascii_case(crate::config::SYSTEM_APP) {
+        return Ok(crate::config::SYSTEM_APP.to_string());
+    }
+    let full = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
+    let full = full.to_string_lossy().into_owned();
+    Ok(match full.strip_prefix(r"\?\UNC\") {
+        Some(unc) => format!(r"\{unc}"),
+        None => full.strip_prefix(r"\?\").unwrap_or(&full).to_string(),
+    })
+}

@@ -4,15 +4,21 @@
 //!
 //! It runs without administrator rights in the user's session and can only
 //! look: it talks to the service over the read-only viewer pipe, which
-//! refuses anything that would change the firewall.
+//! refuses anything that would change the firewall. Changing the whitelist
+//! happens in a separate window (`manage`) that runs with administrator
+//! rights, started from the tray menu through UAC.
 //!
 //!   phoswire-tray            open the window (or bring it up if running)
 //!   phoswire-tray --hidden   start with just the tray icon (for sign-in)
+//!   phoswire-tray --manage   open the whitelist window (asks for
+//!                            administrator rights)
 //!   phoswire-tray --preview  without the service: every program with a
 //!                            connection is shown as if it were whitelisted
 
 #![windows_subsystem = "windows"]
 
+mod icon;
+mod manage;
 mod names;
 mod theme;
 mod view;
@@ -65,6 +71,7 @@ const SS_ENDELLIPSIS: u32 = 0x4000;
 
 const IDM_OPEN: usize = 1;
 const IDM_EXIT: usize = 2;
+const IDM_MANAGE: usize = 3;
 
 /// How often the list is refreshed while the window is open, and the tray
 /// tooltip while it is not.
@@ -118,6 +125,11 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let hidden = args.iter().any(|a| a == "--hidden");
     let preview = args.iter().any(|a| a == "--preview");
+    if args.iter().any(|a| a == manage::ARG) {
+        // A process of its own, with administrator rights; not the tray.
+        manage::run(&args);
+        return;
+    }
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -142,12 +154,8 @@ fn main() {
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         let instance = GetModuleHandleW(null());
-        let big_icon = LoadIconW(null_mut(), IDI_SHIELD);
-        let mut small_icon = null_mut();
-        LoadIconMetric(null_mut(), IDI_SHIELD, LIM_SMALL, &mut small_icon);
-        if small_icon.is_null() {
-            small_icon = big_icon;
-        }
+        // The pink neon ring, drawn at the sizes Windows asks for.
+        let (big_icon, small_icon) = crate::icon::pair();
         let class = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
@@ -485,6 +493,7 @@ fn tray_menu(hwnd: HWND) {
     unsafe {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, IDM_OPEN, w!("&Open Phoswire"));
+        AppendMenuW(menu, MF_STRING, IDM_MANAGE, w!("&Manage whitelist\u{2026}"));
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("E&xit tray icon"));
         SetMenuDefaultItem(menu, IDM_OPEN as u32, 0);
@@ -528,6 +537,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 IDM_OPEN => {
                     with_app(|a| a.show());
                 }
+                IDM_MANAGE => manage::open(hwnd),
                 IDM_EXIT => {
                     DestroyWindow(hwnd);
                 }

@@ -8,7 +8,7 @@
 ; the service at %ProgramFiles%\Phoswire\phoswire.exe.
 
 #define AppName "Phoswire"
-#define AppVersion "0.5.0"
+#define AppVersion "0.6.0"
 #define AppExe "phoswire.exe"
 #define TrayExe "phoswire-tray.exe"
 ; Learning switched on by setup ends by itself, so a forgotten install does
@@ -47,6 +47,8 @@ Source: "..\target\release\{#TrayExe}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Phoswire Connections"; Filename: "{app}\{#TrayExe}"
+; Asks for administrator rights itself when started.
+Name: "{autoprograms}\Phoswire Whitelist"; Filename: "{app}\{#TrayExe}"; Parameters: "--manage"
 Name: "{commonstartup}\Phoswire Tray"; Filename: "{app}\{#TrayExe}"; Parameters: "--hidden"; Tasks: tray
 
 [Run]
