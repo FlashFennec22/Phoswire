@@ -23,7 +23,7 @@ Phoswire barely exists from a system resources perspective, taking up just over 
 
 The firewall is controlled from the command line. I would prefer to keep the service as slim and trim as possible.
 
-There is an optional, read-only window for watching it: `phoswire-tray.exe` puts a shield icon in the notification area. Clicking the icon opens a list of whitelisted apps; clicking an app opens it to show the addresses it is connected to right now, with host names, ports, state, direction and process ID. It refreshes every two seconds while open.
+There is an optional, read-only window for watching it: `phoswire-tray.exe` puts a shield icon in the notification area. Clicking the icon opens a list of whitelisted apps; clicking an app opens it to show the addresses it is connected to right now, with host names, ports, state, direction and process ID. It refreshes every two seconds while open, and follows the light or dark app mode set in Windows (Settings > Personalization > Colors), switching when it changes.
 
 - `phoswire-tray` opens the window, or brings up the one already running.
 - `phoswire-tray --hidden` starts with just the icon. The installer can do this at sign-in.

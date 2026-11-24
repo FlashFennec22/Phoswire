@@ -14,6 +14,7 @@
 #![windows_subsystem = "windows"]
 
 mod names;
+mod theme;
 mod view;
 
 use std::cell::RefCell;
@@ -49,6 +50,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SNAPSHOT: u32 = WM_APP + 2;
 const WM_NAMES: u32 = WM_APP + 3;
 const WM_SHOW: u32 = WM_APP + 4;
+/// Take up the theme again; posted, so it runs when the window state is free.
+const WM_RETHEME: u32 = WM_APP + 5;
 
 const ID_LIST: usize = 100;
 const ID_STATUS: usize = 101;
@@ -227,6 +230,7 @@ fn main() {
         APP.with(|a| *a.borrow_mut() = Some(app));
         with_app(|a| {
             a.apply_font();
+            a.apply_theme();
             a.layout();
             a.add_tray_icon();
         });
@@ -312,6 +316,19 @@ impl App {
                 DeleteObject(self.font as HGDIOBJ);
             }
             self.font = font;
+        }
+    }
+
+    /// Takes up the light or dark theme Windows asks for now.
+    fn apply_theme(&mut self) {
+        let theme = theme::reload();
+        theme.apply_title_bar(self.hwnd);
+        for button in [self.expand, self.collapse, self.idle] {
+            theme.apply_button(button);
+        }
+        self.list.set_theme(&theme);
+        unsafe {
+            RedrawWindow(self.hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
     }
 
@@ -542,10 +559,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.on_dpi_changed(loword(wp) as u32, suggested));
             0
         }
-        WM_CTLCOLORSTATIC => {
-            // Match the window background behind the label and checkbox.
-            SetBkMode(wp as HDC, TRANSPARENT as i32);
-            GetSysColorBrush(COLOR_WINDOW) as LRESULT
+        WM_ERASEBKGND => {
+            let mut rc: RECT = zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(wp as HDC, &rc, theme::get().brush);
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            // Match the window background behind the label, the checkbox and
+            // the corners of the buttons.
+            let hdc = wp as HDC;
+            SetBkMode(hdc, TRANSPARENT as i32);
+            let theme = theme::get();
+            SetTextColor(hdc, theme.text);
+            theme.brush as LRESULT
+        }
+        WM_NOTIFY => {
+            let hdr = &*(lp as *const NMHDR);
+            if hdr.idFrom == ID_IDLE && hdr.code == NM_CUSTOMDRAW {
+                let cd = &*(lp as *const NMCUSTOMDRAW);
+                theme::draw_checkbox(cd)
+            } else if hdr.idFrom == ID_LIST && hdr.code == NM_CUSTOMDRAW {
+                let cd = &*(lp as *const NMLVCUSTOMDRAW);
+                view::custom_draw(cd)
+            } else {
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+        }
+        WM_RETHEME => {
+            with_app(|a| a.apply_theme());
+            0
+        }
+        WM_SETTINGCHANGE if theme::is_theme_setting(wp, lp) => {
+            PostMessageW(hwnd, WM_RETHEME, 0, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
+            PostMessageW(hwnd, WM_RETHEME, 0, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CLOSE => {
             // Closing the window leaves the tray icon; Exit is in its menu.
