@@ -23,13 +23,20 @@ Phoswire barely exists from a system resources perspective, taking up just over 
 
 The firewall is controlled from the command line. I would prefer to keep the service as slim and trim as possible.
 
-There is an optional, read-only window for watching it: `phoswire-tray.exe` puts a shield icon in the notification area. Clicking the icon opens a list of whitelisted apps; clicking an app opens it to show the addresses it is connected to right now, with host names, ports, state, direction and process ID. It refreshes every two seconds while open, and follows the light or dark app mode set in Windows (Settings > Personalization > Colors), switching when it changes.
+There is an optional, read-only window for watching it: `phoswire-tray.exe` puts a pink neon ring in the notification area. Clicking the icon opens a list of whitelisted apps; clicking an app opens it to show the addresses it is connected to right now, with host names, ports, state, direction and process ID. It refreshes every two seconds while open, and follows the light or dark app mode set in Windows (Settings > Personalization > Colors), switching when it changes.
 
 - `phoswire-tray` opens the window, or brings up the one already running.
 - `phoswire-tray --hidden` starts with just the icon. The installer can do this at sign-in.
 - Closing the window keeps the icon. To quit, right-click the icon and choose *Exit tray icon*.
 
 The tray runs without administrator rights and cannot change anything. It reads from the service through a second pipe that refuses every request that would change the firewall. `phoswire connections` prints the same list in an elevated terminal.
+
+To change the whitelist without a terminal, right-click the icon and choose *Manage whitelist…*. Windows asks for administrator rights (UAC) and then opens a window listing every entry:
+
+- *Add entry…* opens the usual Windows file dialog, limited to programs (`.exe`). Several can be picked at once. A program in a folder that ordinary users can write to gets a warning first (see *Rules trust a path, not a file* below).
+- *Delete entry* (or the Delete key) removes the selected entries after asking.
+
+This window is a separate process from the tray (`phoswire-tray --manage`, also in the Start menu as *Phoswire Whitelist*). It sends its changes through the same administrators-only pipe as `phoswire allow` and `phoswire remove`, so it can do nothing an elevated terminal could not, and the tray itself still never runs elevated. Entries for a single Windows service, inbound access and `--exact` are still set from the terminal.
 
 Host names come from the Windows DNS cache where possible, so they show the name an app looked up (`www.youtube.com`) rather than the provider's internal name a reverse lookup returns. Apps that resolve names themselves, as some browsers with secure DNS do, only get reverse-lookup names, or none. Only TCP connections are listed; UDP has no connections to show.
 

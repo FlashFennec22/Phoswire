@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use phoswire::config::{self, Mode, Source, SYSTEM_APP};
+use phoswire::config::{self, Mode, Source};
 use phoswire::ipc::{self, Reply, Request};
 use phoswire::{service, win};
 
@@ -109,11 +109,11 @@ fn run(command: Command) -> Result<(), String> {
         Command::Status => Request::Status,
         Command::Mode { mode, hours } => Request::SetMode { mode, hours },
         Command::Allow { path, service, inbound, outbound_only, exact } => {
-            Request::Allow { path: resolve_path(&path)?, service, inbound, outbound_only, exact }
+            Request::Allow { path: win::resolve_path(&path)?, service, inbound, outbound_only, exact }
         }
         Command::Remove { target, service } => match target.parse::<usize>() {
             Ok(index) if service.is_none() => Request::RemoveIndex { index },
-            _ => Request::Remove { path: resolve_path(&target).unwrap_or(target), service },
+            _ => Request::Remove { path: win::resolve_path(&target).unwrap_or(target), service },
         },
         Command::List => Request::List,
         Command::Blocked { clear: true } => Request::ClearBlocked,
@@ -121,20 +121,6 @@ fn run(command: Command) -> Result<(), String> {
         Command::Connections => Request::Connections,
     };
     print_reply(ipc::request(&request)?)
-}
-
-/// Makes a path absolute relative to the caller's directory, since the
-/// service has a different working directory.
-fn resolve_path(path: &str) -> Result<String, String> {
-    if path.eq_ignore_ascii_case(SYSTEM_APP) {
-        return Ok(SYSTEM_APP.to_string());
-    }
-    let full = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
-    let full = full.to_string_lossy().into_owned();
-    Ok(match full.strip_prefix(r"\\?\UNC\") {
-        Some(unc) => format!(r"\\{unc}"),
-        None => full.strip_prefix(r"\\?\").unwrap_or(&full).to_string(),
-    })
 }
 
 fn age(then: u64) -> String {
