@@ -41,7 +41,6 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use names::{Lookup, Resolver};
-use theme::Theme;
 use view::View;
 
 const CLASS: windows_sys::core::PCWSTR = w!("PhoswireTrayWindow");
@@ -51,6 +50,8 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_SNAPSHOT: u32 = WM_APP + 2;
 const WM_NAMES: u32 = WM_APP + 3;
 const WM_SHOW: u32 = WM_APP + 4;
+/// Take up the theme again; posted, so it runs when the window state is free.
+const WM_RETHEME: u32 = WM_APP + 5;
 
 const ID_LIST: usize = 100;
 const ID_STATUS: usize = 101;
@@ -94,7 +95,6 @@ struct App {
     collapse: HWND,
     list: View,
     font: HFONT,
-    theme: Theme,
     dpi: u32,
     preview: bool,
     shared: Arc<Shared>,
@@ -220,7 +220,6 @@ fn main() {
             collapse,
             list: View::new(list_hwnd, dpi),
             font: null_mut(),
-            theme: Theme::current(),
             dpi,
             preview,
             shared: shared.clone(),
@@ -322,12 +321,12 @@ impl App {
 
     /// Takes up the light or dark theme Windows asks for now.
     fn apply_theme(&mut self) {
-        self.theme = Theme::current();
-        self.theme.apply_title_bar(self.hwnd);
+        let theme = theme::reload();
+        theme.apply_title_bar(self.hwnd);
         for button in [self.expand, self.collapse, self.idle] {
-            self.theme.apply_button(button);
+            theme.apply_button(button);
         }
-        self.list.set_theme(&self.theme);
+        self.list.set_theme(&theme);
         unsafe {
             RedrawWindow(self.hwnd, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
         }
@@ -561,32 +560,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ERASEBKGND => {
-            let painted = with_app(|a| {
-                let mut rc: RECT = zeroed();
-                GetClientRect(hwnd, &mut rc);
-                FillRect(wp as HDC, &rc, a.theme.brush);
-            });
-            match painted {
-                Some(()) => 1,
-                None => DefWindowProcW(hwnd, msg, wp, lp),
-            }
+            let mut rc: RECT = zeroed();
+            GetClientRect(hwnd, &mut rc);
+            FillRect(wp as HDC, &rc, theme::get().brush);
+            1
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             // Match the window background behind the label, the checkbox and
             // the corners of the buttons.
             let hdc = wp as HDC;
             SetBkMode(hdc, TRANSPARENT as i32);
-            with_app(|a| {
-                SetTextColor(hdc, a.theme.text);
-                a.theme.brush as LRESULT
-            })
-            .unwrap_or_else(|| GetSysColorBrush(COLOR_WINDOW) as LRESULT)
+            let theme = theme::get();
+            SetTextColor(hdc, theme.text);
+            theme.brush as LRESULT
         }
         WM_NOTIFY => {
             let hdr = &*(lp as *const NMHDR);
             if hdr.idFrom == ID_IDLE && hdr.code == NM_CUSTOMDRAW {
                 let cd = &*(lp as *const NMCUSTOMDRAW);
-                with_app(|a| theme::draw_checkbox(&a.theme, cd, a.font, a.dpi)).unwrap_or(CDRF_DODEFAULT as LRESULT)
+                theme::draw_checkbox(cd)
             } else if hdr.idFrom == ID_LIST && hdr.code == NM_CUSTOMDRAW {
                 let cd = &*(lp as *const NMLVCUSTOMDRAW);
                 view::custom_draw(cd)
@@ -594,12 +586,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
         }
-        WM_SETTINGCHANGE if theme::is_theme_setting(wp, lp) => {
+        WM_RETHEME => {
             with_app(|a| a.apply_theme());
+            0
+        }
+        WM_SETTINGCHANGE if theme::is_theme_setting(wp, lp) => {
+            PostMessageW(hwnd, WM_RETHEME, 0, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_THEMECHANGED | WM_SYSCOLORCHANGE => {
-            with_app(|a| a.apply_theme());
+            PostMessageW(hwnd, WM_RETHEME, 0, 0);
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_CLOSE => {

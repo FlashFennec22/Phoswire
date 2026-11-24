@@ -8,9 +8,11 @@
 //! are painted here. With a high-contrast theme on, the system colours are
 //! left alone.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr::{null, null_mut};
+use std::rc::Rc;
 
 use windows_sys::core::{w, BOOL, PCWSTR};
 use windows_sys::Win32::Foundation::*;
@@ -19,7 +21,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::HiDpi::OpenThemeDataForDpi;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, OpenThemeDataForDpi};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 /// Windows 11's dark window background and text.
@@ -85,6 +87,24 @@ impl Drop for Theme {
     }
 }
 
+thread_local! {
+    static CURRENT: RefCell<Option<Rc<Theme>>> = const { RefCell::new(None) };
+}
+
+/// The theme in use. Kept apart from the rest of the window's state: a
+/// control asks for its colours while it repaints, and it repaints at once
+/// when its text is set, which happens while that state is in use.
+pub fn get() -> Rc<Theme> {
+    CURRENT.with(|c| c.borrow_mut().get_or_insert_with(|| Rc::new(Theme::current())).clone())
+}
+
+/// Takes up the theme Windows asks for now, and returns it.
+pub fn reload() -> Rc<Theme> {
+    let theme = Rc::new(Theme::current());
+    CURRENT.with(|c| *c.borrow_mut() = Some(theme.clone()));
+    theme
+}
+
 /// Whether the "Choose your app mode" setting is Dark. A high-contrast theme
 /// brings its own colours, so it counts as not dark.
 fn apps_use_dark_mode() -> bool {
@@ -126,7 +146,8 @@ pub fn is_theme_setting(wp: WPARAM, lp: LPARAM) -> bool {
 /// Paints a checkbox for the dark theme, where the themed control would
 /// write its label in black whatever colour it is asked for. Answers the
 /// checkbox's `NM_CUSTOMDRAW`.
-pub fn draw_checkbox(theme: &Theme, cd: &NMCUSTOMDRAW, font: HFONT, dpi: u32) -> LRESULT {
+pub fn draw_checkbox(cd: &NMCUSTOMDRAW) -> LRESULT {
+    let theme = get();
     if !theme.dark {
         return CDRF_DODEFAULT as LRESULT;
     }
@@ -136,6 +157,8 @@ pub fn draw_checkbox(theme: &Theme, cd: &NMCUSTOMDRAW, font: HFONT, dpi: u32) ->
     let hwnd = cd.hdr.hwndFrom;
     let hdc = cd.hdc;
     let rc = cd.rc;
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let font = unsafe { SendMessageW(hwnd, WM_GETFONT, 0, 0) } as HFONT;
     unsafe {
         FillRect(hdc, &rc, theme.brush);
 
