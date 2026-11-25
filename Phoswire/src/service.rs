@@ -1001,6 +1001,16 @@ pub fn uninstall() -> Result<String, String> {
     Ok(format!("uninstalled; the whitelist is kept in {}", Config::dir().display()))
 }
 
+/// Whether the service is running (or on its way up), asked of the service
+/// manager; needs no administrator rights. `None` if it is not installed or
+/// cannot be asked.
+pub fn running() -> Option<bool> {
+    let scm = manager(ServiceManagerAccess::CONNECT).ok()?;
+    let service = scm.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).ok()?;
+    let state = service.query_status().ok()?.current_state;
+    Some(matches!(state, ServiceState::Running | ServiceState::StartPending | ServiceState::ContinuePending))
+}
+
 pub fn start() -> Result<String, String> {
     let scm = manager(ServiceManagerAccess::CONNECT)?;
     let service = scm
