@@ -6,17 +6,23 @@
 //! look: it talks to the service over the read-only viewer pipe, which
 //! refuses anything that would change the firewall. Changing the whitelist
 //! happens in a separate window (`manage`) that runs with administrator
-//! rights, started from the tray menu through UAC.
+//! rights, started from the tray menu through UAC. Starting and stopping the
+//! service and switching learning mode on and off (`control`) likewise run in
+//! a short-lived elevated copy of this program.
 //!
 //!   phoswire-tray            open the window (or bring it up if running)
 //!   phoswire-tray --hidden   start with just the tray icon (for sign-in)
 //!   phoswire-tray --manage   open the whitelist window (asks for
 //!                            administrator rights)
+//!   phoswire-tray --control start|stop|learning-on|learning-off
+//!                            do that one thing (asks for administrator
+//!                            rights)
 //!   phoswire-tray --preview  without the service: every program with a
 //!                            connection is shown as if it were whitelisted
 
 #![windows_subsystem = "windows"]
 
+mod control;
 mod icon;
 mod manage;
 mod names;
@@ -35,6 +41,7 @@ use std::time::Duration;
 use phoswire::config::{Config, Mode, Source};
 use phoswire::conns::{self, AppConnections};
 use phoswire::ipc::{self, Reply, Request};
+use phoswire::service;
 use phoswire::win::{self, wide};
 use windows_sys::core::w;
 use windows_sys::Win32::Foundation::*;
@@ -58,6 +65,8 @@ const WM_NAMES: u32 = WM_APP + 3;
 const WM_SHOW: u32 = WM_APP + 4;
 /// Take up the theme again; posted, so it runs when the window state is free.
 const WM_RETHEME: u32 = WM_APP + 5;
+/// An elevated `control` action has finished: look at the service again.
+const WM_CONTROL_DONE: u32 = WM_APP + 6;
 
 const ID_LIST: usize = 100;
 const ID_STATUS: usize = 101;
@@ -72,6 +81,9 @@ const SS_ENDELLIPSIS: u32 = 0x4000;
 const IDM_OPEN: usize = 1;
 const IDM_EXIT: usize = 2;
 const IDM_MANAGE: usize = 3;
+const IDM_START: usize = 4;
+const IDM_STOP: usize = 5;
+const IDM_LEARNING: usize = 6;
 
 /// How often the list is refreshed while the window is open, and the tray
 /// tooltip while it is not.
@@ -84,6 +96,8 @@ static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 enum Snapshot {
     Ok { mode: Mode, apps: Vec<AppConnections> },
+    /// The service is installed but not running.
+    Stopped,
     Err(String),
 }
 
@@ -128,6 +142,11 @@ fn main() {
     if args.iter().any(|a| a == manage::ARG) {
         // A process of its own, with administrator rights; not the tray.
         manage::run(&args);
+        return;
+    }
+    if args.iter().any(|a| a == control::ARG) {
+        // Likewise: one elevated action, then exit.
+        control::run(&args);
         return;
     }
     unsafe {
@@ -280,6 +299,7 @@ fn fetch(preview: bool) -> Snapshot {
         Ok(Reply::Connections { mode, apps }) => Snapshot::Ok { mode, apps },
         Ok(Reply::Error { message }) => Snapshot::Err(message),
         Ok(_) => Snapshot::Err("unexpected answer from the service".into()),
+        Err(_) if service::running() == Some(false) => Snapshot::Stopped,
         Err(e) => Snapshot::Err(e),
     }
 }
@@ -422,6 +442,10 @@ impl App {
         let show_idle = unsafe { SendMessageW(self.idle, BM_GETCHECK, 0, 0) } == BST_CHECKED as isize;
         let (status, tip) = match &self.snapshot {
             None => return,
+            Some(Snapshot::Stopped) => (
+                "Phoswire is stopped: only Windows Firewall applies. Start it from the tray icon's menu.".to_string(),
+                "Phoswire: stopped".to_string(),
+            ),
             Some(Snapshot::Err(e)) => (format!("Not connected: {e}"), "Phoswire: service unreachable".to_string()),
             Some(Snapshot::Ok { mode, apps }) => {
                 let total: usize = apps.iter().map(|a| a.connections.len()).sum();
@@ -464,6 +488,19 @@ impl App {
         self.list.update(apps, show_idle, &mut host);
     }
 
+    /// Whether the service last said it is in learning mode.
+    fn learning(&self) -> bool {
+        matches!(self.snapshot, Some(Snapshot::Ok { mode: Mode::Learning, .. }))
+    }
+
+    /// Looks at the service again now, after it was started, stopped or
+    /// switched from the menu.
+    fn refresh_now(&self) {
+        if let Some(worker) = self.shared.worker.get() {
+            worker.unpark();
+        }
+    }
+
     fn on_dpi_changed(&mut self, dpi: u32, suggested: &RECT) {
         self.dpi = dpi;
         self.apply_font();
@@ -489,11 +526,28 @@ fn copy_tip(dst: &mut [u16; 128], text: &str) {
     dst[w.len()] = 0;
 }
 
+/// What the menu offers depends on the service: whether it is running, and
+/// whether it is learning.
 fn tray_menu(hwnd: HWND) {
+    // Asked now rather than taken from the last snapshot, which may be 15
+    // seconds old. `None`: not installed, or the service manager could not
+    // be asked.
+    let running = service::running();
+    let learning = with_app(|a| a.learning()).unwrap_or(false);
+    let enabled = |on: bool| if on { MF_ENABLED } else { MF_GRAYED };
     unsafe {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, IDM_OPEN, w!("&Open Phoswire"));
         AppendMenuW(menu, MF_STRING, IDM_MANAGE, w!("&Manage whitelist\u{2026}"));
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING | enabled(running == Some(false)), IDM_START, w!("&Start Phoswire"));
+        AppendMenuW(menu, MF_STRING | enabled(running == Some(true)), IDM_STOP, w!("S&top Phoswire"));
+        AppendMenuW(
+            menu,
+            MF_STRING | enabled(running == Some(true)) | if learning { MF_CHECKED } else { MF_UNCHECKED },
+            IDM_LEARNING,
+            w!("&Learning mode"),
+        );
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, IDM_EXIT, w!("E&xit tray icon"));
         SetMenuDefaultItem(menu, IDM_OPEN as u32, 0);
@@ -538,6 +592,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     with_app(|a| a.show());
                 }
                 IDM_MANAGE => manage::open(hwnd),
+                IDM_START => control::launch(hwnd, control::Action::Start, WM_CONTROL_DONE),
+                IDM_STOP => control::launch(hwnd, control::Action::Stop, WM_CONTROL_DONE),
+                IDM_LEARNING => {
+                    // Off means back to normal, from learning or disabled alike.
+                    let action = match with_app(|a| a.learning()) {
+                        Some(true) => control::Action::LearningOff,
+                        _ => control::Action::LearningOn,
+                    };
+                    control::launch(hwnd, action, WM_CONTROL_DONE);
+                }
                 IDM_EXIT => {
                     DestroyWindow(hwnd);
                 }
@@ -595,6 +659,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             } else {
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
+        }
+        WM_CONTROL_DONE => {
+            with_app(|a| a.refresh_now());
+            0
         }
         WM_RETHEME => {
             with_app(|a| a.apply_theme());

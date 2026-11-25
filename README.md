@@ -28,6 +28,11 @@ To change the whitelist without a terminal, right-click the tray icon and choose
 - *Add entry…* opens the usual Windows file dialog, limited to programs (`.exe`). Several can be picked at once. A program in a folder that ordinary users can write to gets a warning first (see *Rules trust a path, not a file* below).
 - *Delete entry* (or the Delete key) removes the selected entries after asking.
 
+The same menu can also start and stop the firewall and switch learning mode, each after a UAC prompt:
+
+- *Start Phoswire* and *Stop Phoswire* start and stop the service, like `phoswire start` and `phoswire stop`. While it is stopped, only Windows Firewall applies.
+- *Learning mode* is checked while learning is on. Clicking it switches learning on, or back to normal mode. Unlike `phoswire mode learning --hours N`, learning switched on here has no end time, so remember to switch it off.
+
 ## How do I use it?
 
 Type **phoswire** into an elevated terminal after installing for a list of commands. If you don't know what this means, I would advise against using it for now. The tray icon does expose some functionality graphically.
