@@ -30,7 +30,7 @@ To change the whitelist without a terminal, right-click the icon and choose *Man
 
 ## How do I use it?
 
-Type **phoswire** into an elevated terminal after installing for a list of commands. If you don't know what this means, I would advise against using it for now.
+Type **phoswire** into an elevated terminal after installing for a list of commands. If you don't know what this means, I would advise against using it for now. The tray icon does expose some functionality graphically.
 
 ## Is there an updater function?
 
