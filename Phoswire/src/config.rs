@@ -62,6 +62,26 @@ pub fn eq_ignore_case(a: &str, b: &str) -> bool {
     a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
 }
 
+/// Drops the `\\?\` prefix that `canonicalize` puts in front of a path:
+/// `\\?\C:\dir\app.exe` becomes `C:\dir\app.exe`, and
+/// `\\?\UNC\server\share\app.exe` becomes `\\server\share\app.exe`.
+///
+/// Rules are compared with, and turned into version patterns from, the
+/// plain form WFP reports, so the prefix must never reach the whitelist.
+/// Paths that have no plain form (`\\?\Volume{...}\...`) are left as they are.
+pub fn strip_verbatim(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix(r"UNC\").or_else(|| rest.strip_prefix(r"unc\")) {
+            return format!(r"\\{unc}");
+        }
+        let b = rest.as_bytes();
+        if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
+}
+
 /// True for a rule path with a version wildcard (see [`version_pattern`]).
 pub fn is_pattern(path: &str) -> bool {
     path.contains('*')
@@ -364,25 +384,52 @@ impl Config {
             }
         }
         if !changed.is_empty() {
-            let mut merged: Vec<Rule> = Vec::with_capacity(self.rules.len());
-            for rule in std::mem::take(&mut self.rules) {
-                let same = merged
-                    .iter_mut()
-                    .find(|m| m.exact == rule.exact && m.same_subject(&rule.path, rule.service.as_deref()));
-                match same {
-                    Some(m) => {
-                        m.inbound |= rule.inbound;
-                        if rule.source == Source::Manual {
-                            m.source = Source::Manual;
-                        }
-                        m.added = m.added.min(rule.added);
-                    }
-                    None => merged.push(rule),
-                }
-            }
-            self.rules = merged;
+            self.merge_duplicates();
         }
         changed
+    }
+
+    /// Takes the `\\?\` prefix off rule paths saved by versions that left it
+    /// on (see [`strip_verbatim`]), and merges rules that turn out to be the
+    /// same, such as one added by hand with the prefix and one learned
+    /// without it. Returns `(old, new)` for each rule changed.
+    pub fn normalize_paths(&mut self) -> Vec<(String, String)> {
+        let mut changed = Vec::new();
+        for rule in &mut self.rules {
+            let plain = strip_verbatim(&rule.path);
+            if plain != rule.path {
+                let old = rule.subject();
+                rule.path = plain;
+                changed.push((old, rule.subject()));
+            }
+        }
+        if !changed.is_empty() {
+            self.merge_duplicates();
+        }
+        changed
+    }
+
+    /// Folds rules for the same subject into the first of them: inbound
+    /// access is kept if either had it, a rule added by hand stays one, and
+    /// the earliest date is kept.
+    fn merge_duplicates(&mut self) {
+        let mut merged: Vec<Rule> = Vec::with_capacity(self.rules.len());
+        for rule in std::mem::take(&mut self.rules) {
+            let same = merged
+                .iter_mut()
+                .find(|m| m.exact == rule.exact && m.same_subject(&rule.path, rule.service.as_deref()));
+            match same {
+                Some(m) => {
+                    m.inbound |= rule.inbound;
+                    if rule.source == Source::Manual {
+                        m.source = Source::Manual;
+                    }
+                    m.added = m.added.min(rule.added);
+                }
+                None => merged.push(rule),
+            }
+        }
+        self.rules = merged;
     }
 
     /// Adds a rule; returns false if an identical subject already existed
@@ -529,6 +576,59 @@ mod tests {
         assert!(found.iter().all(|p| path_matches(&pattern, p)));
         fs::remove_dir_all(&root).unwrap();
         assert!(expand_pattern(r"C:\no\such\phoswire\*\x.exe").is_err());
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_stripped() {
+        let cases = [
+            (r"\\?\C:\Program Files\App\app.exe", r"C:\Program Files\App\app.exe"),
+            (r"\\?\UNC\server\share\app.exe", r"\\server\share\app.exe"),
+            (r"C:\Program Files\App\app.exe", r"C:\Program Files\App\app.exe"),
+            (r"\\server\share\app.exe", r"\\server\share\app.exe"),
+            ("System", "System"),
+            // No plain form: left alone rather than mangled.
+            (r"\\?\Volume{0b1c2d3e-0000-0000-0000-100000000000}\app.exe", r"\\?\Volume{0b1c2d3e-0000-0000-0000-100000000000}\app.exe"),
+            (r"\device\harddiskvolume3\app.exe", r"\device\harddiskvolume3\app.exe"),
+        ];
+        for (path, want) in cases {
+            assert_eq!(strip_verbatim(path), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn prefixed_rules_are_migrated_merged_and_generalized() {
+        // As saved by builds whose `allow` kept the `\\?\` prefix: a manual
+        // rule next to the rule learned for the same program, and a manual
+        // rule in a versioned folder that never became a pattern.
+        let saved = r#"{"mode":"normal","rules":[
+            {"path":"\\\\?\\C:\\P\\Tool\\tool.exe","inbound":true,"source":"manual","added":50},
+            {"path":"C:\\P\\Tool\\tool.exe","inbound":false,"source":"learned","added":10},
+            {"path":"\\\\?\\C:\\P\\App\\1.2.3\\app.exe","inbound":false,"source":"manual","added":20},
+            {"path":"\\\\?\\C:\\P\\Pinned\\1.0.0\\pin.exe","inbound":false,"source":"manual","added":30,"exact":true},
+            {"path":"\\\\?\\UNC\\server\\share\\net.exe","inbound":false,"source":"manual","added":40}
+        ]}"#;
+        let mut cfg: Config = serde_json::from_str(saved).unwrap();
+        let normalized = cfg.normalize_paths();
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(cfg.rules.len(), 4, "the two rules for tool.exe are one");
+        let tool = &cfg.rules[0];
+        assert_eq!(tool.path, r"C:\P\Tool\tool.exe");
+        assert!(tool.inbound && tool.source == Source::Manual && tool.added == 10);
+        assert_eq!(cfg.rules[3].path, r"\\server\share\net.exe");
+
+        // Plain paths match what WFP reports...
+        assert!(cfg.covers(r"c:\p\tool\tool.exe", None));
+        // ...and now follow updates, except where pinned to one version.
+        let generalized = cfg.generalize(|p| version_pattern(p).filter(|p| p.starts_with(r"C:\P\")));
+        assert_eq!(generalized.len(), 1, "{generalized:?}");
+        assert_eq!(cfg.rules[1].path, r"C:\P\App\*\app.exe");
+        assert!(cfg.covers(r"C:\P\App\1.2.4\app.exe", None));
+        assert_eq!(cfg.rules[2].path, r"C:\P\Pinned\1.0.0\pin.exe");
+        assert!(cfg.rules[2].exact);
+
+        // A second start finds nothing left to do.
+        assert!(cfg.normalize_paths().is_empty());
+        assert!(cfg.generalize(version_pattern).is_empty());
     }
 
     #[test]

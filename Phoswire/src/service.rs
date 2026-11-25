@@ -153,13 +153,20 @@ impl Core {
         if cfg.mode == Mode::Learning && cfg.learning_since.is_none() {
             cfg.learning_since = Some(config::now());
         }
+        // Rules added by hand with earlier builds kept the `\\?\` prefix, which kept
+        // them from matching what WFP reports and from becoming version
+        // patterns. Done first, so that `generalize` below sees plain paths.
+        let normalized = cfg.normalize_paths();
+        for (old, new) in &normalized {
+            log(&format!("rule path {old} is now {new}"));
+        }
         // Rules from before version patterns existed, or made for a single
         // version with a pattern now possible, follow the program from now on.
         let generalized = cfg.generalize(versioned);
         for (old, new) in &generalized {
             log(&format!("{old} now covers every version: {new}"));
         }
-        if !generalized.is_empty() && storage_problem.is_none() {
+        if (!normalized.is_empty() || !generalized.is_empty()) && storage_problem.is_none() {
             if let Err(e) = cfg.save() {
                 log(&format!("saving the config failed: {e}"));
             }
@@ -355,6 +362,8 @@ impl Core {
                 })
             }
             Request::Allow { path, service, inbound, outbound_only, exact } => {
+                // Whatever the client sent, the whitelist only holds plain paths.
+                let path = config::strip_verbatim(&path);
                 // Validate up front so a typo is an error, not a silent no-op.
                 wfp::app_id(&path)?;
                 if let Some(s) = &service {
@@ -389,6 +398,7 @@ impl Core {
                 done(if added { format!("allowed: {what}") } else { format!("already allowed: {what}") })
             }
             Request::Remove { path, service } => {
+                let path = config::strip_verbatim(&path);
                 let index = self
                     .cfg
                     .find_matching(&path, service.as_deref())
