@@ -23,7 +23,7 @@ Phoswire barely exists from a system resources perspective, taking up just over 
 
 Some aspects of the application are still controlled from the command line at this time.
 
-To change the whitelist without a terminal, right-click the icon and choose *Manage whitelist…*. Windows asks for administrator rights (UAC) and then opens a window listing every entry:
+To change the whitelist without a terminal, right-click the tray icon and choose *Manage whitelist…*. Windows asks for administrator rights (UAC) and then opens a window listing every entry:
 
 - *Add entry…* opens the usual Windows file dialog, limited to programs (`.exe`). Several can be picked at once. A program in a folder that ordinary users can write to gets a warning first (see *Rules trust a path, not a file* below).
 - *Delete entry* (or the Delete key) removes the selected entries after asking.
