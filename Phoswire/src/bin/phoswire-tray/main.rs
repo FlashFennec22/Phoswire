@@ -537,7 +537,7 @@ fn tray_menu(hwnd: HWND) {
     let enabled = |on: bool| if on { MF_ENABLED } else { MF_GRAYED };
     unsafe {
         let menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, IDM_OPEN, w!("&Open Phoswire"));
+        AppendMenuW(menu, MF_STRING, IDM_OPEN, w!("Show &connections"));
         AppendMenuW(menu, MF_STRING, IDM_MANAGE, w!("&Manage whitelist\u{2026}"));
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING | enabled(running == Some(false)), IDM_START, w!("&Start Phoswire"));
