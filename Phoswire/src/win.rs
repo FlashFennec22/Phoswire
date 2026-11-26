@@ -768,9 +768,35 @@ pub fn resolve_path(path: &str) -> Result<String, String> {
         return Ok(crate::config::SYSTEM_APP.to_string());
     }
     let full = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
-    let full = full.to_string_lossy().into_owned();
-    Ok(match full.strip_prefix(r"\?\UNC\") {
-        Some(unc) => format!(r"\{unc}"),
-        None => full.strip_prefix(r"\?\").unwrap_or(&full).to_string(),
-    })
+    Ok(crate::config::strip_verbatim(&full.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_paths_have_no_verbatim_prefix() {
+        let notepad = format!(r"{}\System32\notepad.exe", windows_dir());
+        let resolved = resolve_path(&notepad).unwrap();
+        assert!(!resolved.starts_with(r"\\"), "{resolved}");
+        assert!(crate::config::eq_ignore_case(&resolved, &notepad), "{resolved}");
+        // The checks that rely on a plain path see it as the system file it is.
+        assert!(path_protected(&resolved), "{resolved}");
+        assert!(is_svchost(&resolve_path(&system_svchost()).unwrap()));
+    }
+
+    #[test]
+    fn resolved_paths_in_versioned_folders_become_patterns() {
+        let root = std::env::temp_dir().join(format!("phoswire-resolve-{}", std::process::id()));
+        let dir = root.join("App").join("1.2.3");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("app.exe"), b"").unwrap();
+        let resolved = resolve_path(&dir.join("app.exe").to_string_lossy()).unwrap();
+        let pattern = crate::config::version_pattern(&resolved);
+        std::fs::remove_dir_all(&root).unwrap();
+        let pattern = pattern.expect("a resolved path in a versioned folder must give a pattern");
+        assert!(pattern.ends_with(r"\App\*\app.exe"), "{pattern}");
+        assert!(crate::config::path_matches(&pattern, &resolved));
+    }
 }
